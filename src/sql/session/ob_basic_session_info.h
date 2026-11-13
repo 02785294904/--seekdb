@@ -861,6 +861,7 @@ public:
   common::ObObjType get_sys_variable_type(const common::ObString &var_name) const;
   // The following helper function is for conveniently viewing the value of a system variable
   int if_aggr_pushdown_allowed(bool &aggr_pushdown_allowed) const;
+  int is_file_sql_enabled(bool &enabled) const;
   int is_transformation_enabled(bool &transformation_enabled) const;
   int is_serial_set_order_forced(bool &force_set_order) const;
   int is_storage_estimation_enabled(bool &storage_estimation_enabled) const;

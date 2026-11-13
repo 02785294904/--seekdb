@@ -2892,6 +2892,11 @@ int ObBasicSessionInfo::if_aggr_pushdown_allowed(bool &aggr_pushdown_allowed) co
   return get_bool_sys_var(SYS_VAR_OB_ENABLE_AGGREGATION_PUSHDOWN, aggr_pushdown_allowed);
 }
 
+int ObBasicSessionInfo::is_file_sql_enabled(bool &enabled) const
+{
+  return get_bool_sys_var(SYS_VAR_ENABLE_FILE_SQL, enabled);
+}
+
 int ObBasicSessionInfo::get_name_case_mode(ObNameCaseMode &case_mode) const
 {
   int ret = OB_SUCCESS;
