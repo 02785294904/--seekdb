@@ -36,6 +36,7 @@ OB_SERIALIZE_MEMBER_INHERIT(ObFileTableAccessSpec,
                             nullstr_,
                             raw_path_,
                             real_paths_,
+                            column_names_,
                             column_exprs_);
 
 ObFileTableAccessOp::ObFileTableAccessOp(ObExecContext &exec_ctx,
@@ -46,6 +47,7 @@ ObFileTableAccessOp::ObFileTableAccessOp(ObExecContext &exec_ctx,
     column_defs_(),
     file_input_(),
     csv_scanner_(),
+    json_scanner_(),
     scan_ready_(false),
     file_idx_(0)
 {
@@ -54,7 +56,13 @@ ObFileTableAccessOp::ObFileTableAccessOp(ObExecContext &exec_ctx,
 int ObFileTableAccessOp::prepare_scan()
 {
   int ret = OB_SUCCESS;
+  const bool by_name = (FILE_TABLE_JSON == MY_SPEC.kind_);
   column_defs_.reuse();
+  if (by_name && MY_SPEC.column_names_.count() != MY_SPEC.column_exprs_.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json column has no name to match", K(ret), "name_cnt",
+             MY_SPEC.column_names_.count(), "col_cnt", MY_SPEC.column_exprs_.count());
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
     ObFileScanColumnDef def;
     ObExpr *expr = MY_SPEC.column_exprs_.at(i);
@@ -63,6 +71,10 @@ int ObFileTableAccessOp::prepare_scan()
     def.meta_.set_type(OB_ISNULL(expr) ? ObVarcharType : expr->datum_meta_.type_);
     def.meta_.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
     def.is_nullable_ = true;
+    if (by_name) {
+      // a value finds its column through the key the file writes it under
+      def.column_name_ = MY_SPEC.column_names_.at(i);
+    }
     if (OB_FAIL(column_defs_.push_back(def))) {
       LOG_WARN("failed to push column def", K(ret), K(i));
     }
@@ -80,6 +92,17 @@ int ObFileTableAccessOp::prepare_scan()
   return ret;
 }
 
+ObFileScanner *ObFileTableAccessOp::cur_scanner()
+{
+  ObFileScanner *scanner = NULL;
+  if (FILE_TABLE_JSON == MY_SPEC.kind_) {
+    scanner = &json_scanner_;
+  } else {
+    scanner = &csv_scanner_;
+  }
+  return scanner;
+}
+
 int ObFileTableAccessOp::open_current_file()
 {
   int ret = OB_SUCCESS;
@@ -88,8 +111,8 @@ int ObFileTableAccessOp::open_current_file()
     LOG_WARN("file index out of range", K(ret), K_(file_idx));
   } else if (OB_FAIL(file_input_.open(file_alloc_, MY_SPEC.real_paths_.at(file_idx_)))) {
     LOG_WARN("failed to open file", K(ret), "path", MY_SPEC.real_paths_.at(file_idx_));
-  } else if (OB_FAIL(csv_scanner_.open(file_input_, column_defs_))) {
-    LOG_WARN("failed to open csv scanner", K(ret));
+  } else if (OB_FAIL(cur_scanner()->open(file_input_, column_defs_))) {
+    LOG_WARN("failed to open file scanner", K(ret), "kind", MY_SPEC.kind_);
     file_input_.close();
   }
   return ret;
@@ -99,6 +122,7 @@ int ObFileTableAccessOp::close_current_file()
 {
   int ret = OB_SUCCESS;
   csv_scanner_.close();
+  json_scanner_.close();
   file_input_.close();
   file_alloc_.reset();
   return ret;
@@ -118,7 +142,7 @@ int ObFileTableAccessOp::inner_open()
   } else if (FILE_TABLE_GLOB == MY_SPEC.kind_) {
     // glob() lists the resolved paths, the files themselves are never opened
     scan_ready_ = true;
-  } else if (FILE_TABLE_CSV != MY_SPEC.kind_) {
+  } else if (FILE_TABLE_CSV != MY_SPEC.kind_ && FILE_TABLE_JSON != MY_SPEC.kind_) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file format of the file table function");
     LOG_WARN("unsupported file table kind", K(ret), "kind", MY_SPEC.kind_);
@@ -168,8 +192,8 @@ int ObFileTableAccessOp::switch_iterator()
   return ret;
 }
 
-// Hand out the next record. For a CSV table the reader walks the resolved file
-// list in order; for glob() the list itself is the result.
+// Hand out the next record. For a table read out of the file's own contents the
+// reader walks the resolved file list in order; for glob() the list is the result.
 int ObFileTableAccessOp::next_record(common::ObIArray<common::ObString> &row)
 {
   int ret = OB_SUCCESS;
@@ -193,9 +217,9 @@ int ObFileTableAccessOp::next_record(common::ObIArray<common::ObString> &row)
     bool got = false;
     while (OB_SUCC(ret) && !got) {
       row.reuse();
-      if (OB_FAIL(csv_scanner_.next_row(row))) {
+      if (OB_FAIL(cur_scanner()->next_row(row))) {
         if (OB_ITER_END != ret) {
-          LOG_WARN("failed to read csv record", K(ret), K_(file_idx));
+          LOG_WARN("failed to read file record", K(ret), K_(file_idx), "kind", MY_SPEC.kind_);
         } else if (OB_FAIL(close_current_file())) {
           LOG_WARN("failed to close file", K(ret), K_(file_idx));
         } else {
@@ -317,7 +341,7 @@ int ObFileTableAccessOp::write_value(ObExpr &expr,
   }
   if (OB_SUCC(ret) && !matched) {
     ret = OB_INVALID_ARGUMENT;
-    const ObFileScanErrorPos &pos = csv_scanner_.get_last_error_pos();
+    const ObFileScanErrorPos &pos = cur_scanner()->get_last_error_pos();
     ObSqlString msg;
     if (OB_FAIL(msg.append_fmt("value does not fit the inferred column type %s"
                                " at line %ld, byte offset %ld",
@@ -403,6 +427,7 @@ int ObFileTableAccessOp::inner_close()
 void ObFileTableAccessOp::destroy()
 {
   csv_scanner_.close();
+  json_scanner_.close();
   file_input_.close();
   file_alloc_.reset();
   scan_ready_ = false;

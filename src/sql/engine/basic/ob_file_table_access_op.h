@@ -31,10 +31,10 @@ public:
   ObFileTableAccessSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type), kind_(FILE_TABLE_NONE), is_glob_(false), with_header_(true),
       delimiter_(','), quote_('"'), escape_('"'), has_nullstr_(false), nullstr_(),
-      raw_path_(), real_paths_(alloc), column_exprs_(alloc) {}
+      raw_path_(), real_paths_(alloc), column_names_(alloc), column_exprs_(alloc) {}
   INHERIT_TO_STRING_KV("op_spec", ObOpSpec, K_(kind), K_(is_glob), K_(with_header),
                        K_(delimiter), K_(quote), K_(escape), K_(has_nullstr), K_(nullstr),
-                       K_(raw_path), K_(real_paths));
+                       K_(raw_path), K_(real_paths), K_(column_names));
   // FileTableKind, kept as an integer so the spec serializes like the other ops
   int32_t kind_;
   bool is_glob_;
@@ -48,6 +48,10 @@ public:
   common::ObString raw_path_;
   // Canonical files to scan, resolved once when the statement was resolved.
   common::ObFixedArray<common::ObString, common::ObIAllocator> real_paths_;
+  // What the file calls each column, in column order. Only a format that matches
+  // a value to its column by name needs it, and it holds the name from the file
+  // rather than the one SQL ended up showing.
+  common::ObFixedArray<common::ObString, common::ObIAllocator> column_names_;
   common::ObFixedArray<ObExpr *, common::ObIAllocator> column_exprs_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFileTableAccessSpec);
@@ -68,6 +72,9 @@ private:
   int prepare_scan();
   int open_current_file();
   int close_current_file();
+  // The reader of the format this table was resolved from. Both live in the
+  // operator, so no allocation happens per file.
+  ObFileScanner *cur_scanner();
   int next_record(common::ObIArray<common::ObString> &row);
   int write_row(const common::ObIArray<common::ObString> &row);
   int write_value(ObExpr &expr, const common::ObString &text, common::ObDatum &dst);
@@ -76,6 +83,7 @@ private:
   common::ObSEArray<ObFileScanColumnDef, 16> column_defs_;
   ObFileInput file_input_;
   ObCsvScanner csv_scanner_;
+  ObJsonlScanner json_scanner_;
   bool scan_ready_;
   int64_t file_idx_;
   DISALLOW_COPY_AND_ASSIGN(ObFileTableAccessOp);

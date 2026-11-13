@@ -1393,5 +1393,911 @@ int ObFileInput::seek_begin()
   return ret;
 }
 
+namespace
+{
+// A malformed JSON record is a 1210 whose text carries where in the file it
+// happened, the same shape a malformed CSV record is reported with. A JSON
+// record has no field numbering a column could mean, so only the line and the
+// byte offset are quoted.
+void compose_json_error_msg(char *buf,
+                            const int64_t buf_len,
+                            const char *what,
+                            const int64_t line,
+                            const int64_t byte_offset)
+{
+  const int written = ::snprintf(buf, buf_len, "%s at line %ld, byte offset %ld",
+                                 what, line, byte_offset);
+  if (written < 0 || written >= buf_len) {
+    (void)::snprintf(buf, buf_len, "%s", what);
+  }
+}
+
+inline bool is_json_space(const char c)
+{
+  return ' ' == c || '\t' == c || '\n' == c || '\r' == c;
+}
+
+inline bool is_json_hex_digit(const char c, int64_t &value)
+{
+  bool bool_ret = false;
+  value = 0;
+  if (c >= '0' && c <= '9') {
+    value = c - '0';
+    bool_ret = true;
+  } else if (c >= 'a' && c <= 'f') {
+    value = c - 'a' + 10;
+    bool_ret = true;
+  } else if (c >= 'A' && c <= 'F') {
+    value = c - 'A' + 10;
+    bool_ret = true;
+  }
+  return bool_ret;
+}
+
+// Whether a byte may stand inside a value that is not a string. Numbers and the
+// three literals are collected this way and only judged at the end, so a value
+// never gets one rule while being read and another while being converted.
+inline bool is_json_value_char(const char c)
+{
+  return ('0' <= c && c <= '9') || '+' == c || '-' == c || '.' == c
+      || 'e' == c || 'E' == c || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+
+// Keys are matched byte for byte: two keys that differ only in case name two
+// different JSON members, whatever SQL makes of the two column names they get.
+int compare_json_name(const common::ObString &left, const common::ObString &right)
+{
+  int compare_result = 0;
+  if (left.length() != right.length()) {
+    compare_result = left.length() < right.length() ? -1 : 1;
+  } else if (0 == left.length()) {
+    // two empty keys are the same key
+  } else {
+    compare_result = MEMCMP(left.ptr(), right.ptr(), left.length());
+  }
+  return compare_result;
+}
+} // end anonymous namespace
+
+ObJsonlReader::ObJsonlReader()
+  : input_(NULL),
+    record_buf_(),
+    members_(),
+    state_(BEFORE_OBJECT),
+    escape_(ESC_NONE),
+    token_off_(0),
+    hex_value_(0),
+    hex_count_(0),
+    high_part_(0),
+    high_pending_(false),
+    depth_(0),
+    container_string_(false),
+    container_escape_(false),
+    line_(1),
+    rec_start_line_(1),
+    rec_start_off_(0),
+    last_err_pos_()
+{
+}
+
+ObJsonlReader::~ObJsonlReader()
+{
+  close();
+}
+
+int ObJsonlReader::open(ObFileInput &input)
+{
+  input_ = &input;
+  reset_record();
+  state_ = BEFORE_OBJECT;
+  line_ = 1;
+  last_err_pos_.reset();
+  return OB_SUCCESS;
+}
+
+void ObJsonlReader::close()
+{
+  input_ = NULL;
+  reset_record();
+}
+
+int ObJsonlReader::rescan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(input_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json reader is not opened", K(ret));
+  } else if (OB_FAIL(input_->seek_begin())) {
+    LOG_WARN("failed to rewind json file", K(ret));
+  } else {
+    reset_record();
+    state_ = BEFORE_OBJECT;
+    line_ = 1;
+    last_err_pos_.reset();
+  }
+  return ret;
+}
+
+void ObJsonlReader::reset_record()
+{
+  record_buf_.reuse();
+  members_.reuse();
+  escape_ = ESC_NONE;
+  token_off_ = 0;
+  hex_value_ = 0;
+  hex_count_ = 0;
+  high_part_ = 0;
+  high_pending_ = false;
+  depth_ = 0;
+  container_string_ = false;
+  container_escape_ = false;
+}
+
+int ObJsonlReader::structural_error(const char *what, const int64_t byte_offset)
+{
+  const int ret = OB_INVALID_ARGUMENT;
+  last_err_pos_.line_ = line_;
+  last_err_pos_.column_ = 0;
+  last_err_pos_.byte_offset_ = byte_offset;
+  char msg[192] = { 0 };
+  compose_json_error_msg(msg, sizeof(msg), what, line_, byte_offset);
+  LOG_USER_ERROR(OB_INVALID_ARGUMENT, msg);
+  LOG_WARN("invalid json record", K(ret), K(what), K(last_err_pos_));
+  return ret;
+}
+
+int ObJsonlReader::push(const char c)
+{
+  int ret = OB_SUCCESS;
+  if (record_buf_.length() + 1 > ObFileScanLimits::MAX_RECORD_LENGTH) {
+    ret = OB_SIZE_OVERFLOW;
+    last_err_pos_.line_ = line_;
+    last_err_pos_.byte_offset_ = OB_ISNULL(input_) ? 0 : input_->logical_pos();
+    LOG_WARN("json record is too long", K(ret), "length", record_buf_.length() + 1,
+             K(last_err_pos_), "limit", ObFileScanLimits::MAX_RECORD_LENGTH);
+  } else if (OB_FAIL(record_buf_.append(&c, 1))) {
+    LOG_WARN("failed to append to json record buffer", K(ret));
+  }
+  return ret;
+}
+
+// One code point as UTF-8, which is what a text column holds.
+int ObJsonlReader::push_code_point(const uint32_t code_point)
+{
+  int ret = OB_SUCCESS;
+  char buf[4] = { 0 };
+  int64_t len = 1;
+  if (code_point < 0x80) {
+    buf[0] = static_cast<char>(code_point);
+  } else if (code_point < 0x800) {
+    buf[0] = static_cast<char>(0xC0 | (code_point >> 6));
+    buf[1] = static_cast<char>(0x80 | (code_point & 0x3F));
+    len = 2;
+  } else if (code_point < 0x10000) {
+    buf[0] = static_cast<char>(0xE0 | (code_point >> 12));
+    buf[1] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+    buf[2] = static_cast<char>(0x80 | (code_point & 0x3F));
+    len = 3;
+  } else {
+    buf[0] = static_cast<char>(0xF0 | (code_point >> 18));
+    buf[1] = static_cast<char>(0x80 | ((code_point >> 12) & 0x3F));
+    buf[2] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+    buf[3] = static_cast<char>(0x80 | (code_point & 0x3F));
+    len = 4;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < len; ++i) {
+    if (OB_FAIL(push(buf[i]))) {
+      LOG_WARN("failed to append escaped json character", K(ret), K(code_point));
+    }
+  }
+  return ret;
+}
+
+// The token that has just been read belongs to the record: a name opens a new
+// member, a value closes the one the name opened.
+int ObJsonlReader::finish_token(const bool is_name)
+{
+  int ret = OB_SUCCESS;
+  escape_ = ESC_NONE;
+  high_pending_ = false;
+  const int64_t len = record_buf_.length() - token_off_;
+  if (is_name) {
+    ObJsonlMember member;
+    member.key_off_ = token_off_;
+    member.key_len_ = len;
+    if (OB_FAIL(members_.push_back(member))) {
+      LOG_WARN("failed to push json member", K(ret), K(token_off_), K(len));
+    } else {
+      state_ = BEFORE_COLON;
+    }
+  } else if (members_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json value has no member name", K(ret), K(token_off_), K(len));
+  } else {
+    ObJsonlMember &member = members_.at(members_.count() - 1);
+    member.value_off_ = token_off_;
+    member.value_len_ = len;
+    member.is_null_ = false;
+    // only a quoted token can reach here, and what the file put in quotes is a
+    // string whatever its characters look like
+    member.is_string_ = true;
+    state_ = AFTER_VALUE;
+  }
+  return ret;
+}
+
+// A number, true, false or null ends at the first byte that cannot be part of
+// it, and that byte still has to be looked at in the state after the value.
+int ObJsonlReader::finish_plain_value(const int64_t byte_offset)
+{
+  int ret = OB_SUCCESS;
+  // The buffer is only looked at here, while its address is still the one the
+  // token was written into; what the member keeps is the offset.
+  const int64_t len = record_buf_.length() - token_off_;
+  const char *text = (len > 0) ? record_buf_.ptr() + token_off_ : NULL;
+  bool known = true;
+  if (NULL == text) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("empty json value token", K(ret), K(byte_offset));
+  } else {
+    const char first = text[0];
+    if ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+      // a value that starts with a letter is one of the three literals, nothing else
+      if (4 == len && 0 == MEMCMP(text, "null", 4)) {
+        members_.at(members_.count() - 1).is_null_ = true;
+      } else if (!((4 == len && 0 == MEMCMP(text, "true", 4))
+                   || (5 == len && 0 == MEMCMP(text, "false", 5)))) {
+        known = false;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!known) {
+    ret = structural_error("json value is neither a number nor a literal", byte_offset);
+  } else {
+    ObJsonlMember &member = members_.at(members_.count() - 1);
+    member.value_off_ = token_off_;
+    member.value_len_ = len;
+    state_ = AFTER_VALUE;
+  }
+  return ret;
+}
+
+// Everything up to the closing quote of a name or of a string value, with the
+// escapes decoded into the record buffer.
+int ObJsonlReader::step_string(const char c,
+                               const int64_t byte_offset,
+                               const bool is_name)
+{
+  int ret = OB_SUCCESS;
+  switch (escape_) {
+  case ESC_NONE:
+    if ('"' == c) {
+      if (high_pending_) {
+        ret = structural_error("json string ends on an unpaired surrogate", byte_offset);
+      } else if (OB_FAIL(finish_token(is_name))) {
+        LOG_WARN("failed to close json token", K(ret), K(is_name));
+      }
+    } else if ('\\' == c) {
+      escape_ = ESC_CHAR;
+    } else if (OB_FAIL(push(c))) {
+      LOG_WARN("failed to append json string character", K(ret), K(c));
+    }
+    break;
+  case ESC_CHAR:
+    switch (c) {
+    case 'b':
+      escape_ = ESC_NONE;
+      ret = push('\b');
+      break;
+    case 'f':
+      escape_ = ESC_NONE;
+      ret = push('\f');
+      break;
+    case 'n':
+      escape_ = ESC_NONE;
+      ret = push('\n');
+      break;
+    case 'r':
+      escape_ = ESC_NONE;
+      ret = push('\r');
+      break;
+    case 't':
+      escape_ = ESC_NONE;
+      ret = push('\t');
+      break;
+    case '"':
+    case '\\':
+    case '/':
+      escape_ = ESC_NONE;
+      ret = push(c);
+      break;
+    case 'u':
+      escape_ = ESC_DIGITS;
+      hex_value_ = 0;
+      hex_count_ = 0;
+      break;
+    default:
+      ret = structural_error("json string has an unknown escape", byte_offset);
+      break;
+    }
+    break;
+  case ESC_DIGITS: {
+    int64_t digit = 0;
+    if (!is_json_hex_digit(c, digit)) {
+      ret = structural_error("json string has an incomplete unicode escape", byte_offset);
+    } else if (FALSE_IT(hex_value_ = hex_value_ * 16 + digit)) {
+    } else if (++hex_count_ < 4) {
+      // more digits to come
+    } else if (high_pending_) {
+      if (hex_value_ < 0xDC00 || hex_value_ > 0xDFFF) {
+        ret = structural_error("json string has an unpaired surrogate", byte_offset);
+      } else {
+        const uint32_t combined = 0x10000u
+            + ((static_cast<uint32_t>(high_part_) - 0xD800u) << 10)
+            + (static_cast<uint32_t>(hex_value_) - 0xDC00u);
+        high_pending_ = false;
+        escape_ = ESC_NONE;
+        ret = push_code_point(combined);
+      }
+    } else if (hex_value_ >= 0xD800 && hex_value_ <= 0xDBFF) {
+      high_part_ = static_cast<uint32_t>(hex_value_);
+      high_pending_ = true;
+      escape_ = ESC_NONE;
+    } else if (hex_value_ >= 0xDC00 && hex_value_ <= 0xDFFF) {
+      ret = structural_error("json string has an unpaired surrogate", byte_offset);
+    } else {
+      escape_ = ESC_NONE;
+      ret = push_code_point(static_cast<uint32_t>(hex_value_));
+    }
+    break;
+  }
+  default:
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected json escape state", K(ret), "escape", static_cast<int>(escape_));
+    break;
+  }
+  return ret;
+}
+
+// A nested value is not interpreted; it is kept as the bytes the file holds, so
+// that it travels into a text column unchanged. Only the nesting and the quoted
+// strings inside it have to be understood to know where it ends.
+int ObJsonlReader::step_container(const char c)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(push(c))) {
+    LOG_WARN("failed to append json container byte", K(ret), K(c));
+  } else if (container_escape_) {
+    container_escape_ = false;
+  } else if (container_string_) {
+    if ('\\' == c) {
+      container_escape_ = true;
+    } else if ('"' == c) {
+      container_string_ = false;
+    }
+  } else if ('"' == c) {
+    container_string_ = true;
+  } else if ('{' == c || '[' == c) {
+    ++depth_;
+  } else if ('}' == c || ']' == c) {
+    --depth_;
+    if (depth_ <= 0) {
+      if (members_.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("json container has no member name", K(ret));
+      } else {
+        ObJsonlMember &member = members_.at(members_.count() - 1);
+        member.value_off_ = token_off_;
+        member.value_len_ = record_buf_.length() - token_off_;
+        member.is_null_ = false;
+        state_ = AFTER_VALUE;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObJsonlReader::step(const char c,
+                        const int64_t byte_offset,
+                        bool &record_done,
+                        bool &retry)
+{
+  int ret = OB_SUCCESS;
+  const bool space = is_json_space(c);
+  switch (state_) {
+  case BEFORE_OBJECT:
+    if (space) {
+      // whitespace between two records carries no value
+    } else if ('{' == c) {
+      rec_start_line_ = line_;
+      rec_start_off_ = byte_offset;
+      // the opening brace is the record itself, the name machine starts behind it
+      state_ = BEFORE_NAME;
+    } else {
+      ret = structural_error("file record is not a JSON object", byte_offset);
+    }
+    break;
+  case BEFORE_NAME:
+    if (space) {
+    } else if ('"' == c) {
+      token_off_ = record_buf_.length();
+      escape_ = ESC_NONE;
+      high_pending_ = false;
+      state_ = IN_NAME;
+    } else if ('}' == c) {
+      record_done = true;
+    } else if (':' == c || ',' == c) {
+      ret = structural_error("json object member has no name", byte_offset);
+    } else {
+      ret = structural_error("json object member name is not a string", byte_offset);
+    }
+    break;
+  case IN_NAME:
+    ret = step_string(c, byte_offset, true);
+    break;
+  case BEFORE_COLON:
+    if (space) {
+    } else if (':' == c) {
+      state_ = BEFORE_VALUE;
+    } else {
+      ret = structural_error("json object member has no colon", byte_offset);
+    }
+    break;
+  case BEFORE_VALUE:
+    if (space) {
+    } else if ('"' == c) {
+      token_off_ = record_buf_.length();
+      escape_ = ESC_NONE;
+      high_pending_ = false;
+      state_ = IN_STRING_VALUE;
+    } else if ('{' == c || '[' == c) {
+      token_off_ = record_buf_.length();
+      depth_ = 1;
+      container_string_ = false;
+      container_escape_ = false;
+      if (OB_FAIL(push(c))) {
+        LOG_WARN("failed to start json container value", K(ret), K(c));
+      } else {
+        state_ = IN_CONTAINER;
+      }
+    } else if (is_json_value_char(c)) {
+      token_off_ = record_buf_.length();
+      if (OB_FAIL(push(c))) {
+        LOG_WARN("failed to start json value", K(ret), K(c));
+      } else {
+        state_ = IN_PLAIN_VALUE;
+      }
+    } else {
+      ret = structural_error("json object member has no value", byte_offset);
+    }
+    break;
+  case IN_STRING_VALUE:
+    ret = step_string(c, byte_offset, false);
+    break;
+  case IN_PLAIN_VALUE:
+    if (is_json_value_char(c)) {
+      if (OB_FAIL(push(c))) {
+        LOG_WARN("failed to append json value character", K(ret), K(c));
+      }
+    } else if (OB_FAIL(finish_plain_value(byte_offset))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to close json value", K(ret), K(byte_offset));
+      }
+    } else {
+      // the byte that ended the value belongs to the state after it
+      retry = true;
+    }
+    break;
+  case IN_CONTAINER:
+    ret = step_container(c);
+    break;
+  case AFTER_VALUE:
+    if (space) {
+    } else if (',' == c) {
+      state_ = BEFORE_NAME;
+    } else if ('}' == c) {
+      record_done = true;
+    } else {
+      ret = structural_error("json object has unexpected text in it", byte_offset);
+    }
+    break;
+  default:
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected json state", K(ret), "state", static_cast<int>(state_));
+    break;
+  }
+  return ret;
+}
+
+int ObJsonlReader::next_object(common::ObIArray<ObJsonlMember> &members)
+{
+  int ret = OB_SUCCESS;
+  members.reuse();
+  if (OB_ISNULL(input_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json reader is not opened", K(ret));
+  } else {
+    // The record handed out last shares this buffer with the caller, so it is
+    // cleared here rather than when that record was returned.
+    reset_record();
+    bool record_done = false;
+    bool hit_eof = false;
+    while (OB_SUCC(ret) && !record_done && !hit_eof) {
+      const common::ObString window = input_->buffered();
+      if (window.empty()) {
+        if (OB_FAIL(input_->fill())) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+            hit_eof = true;
+          } else {
+            LOG_WARN("failed to fill json read window", K(ret));
+          }
+        }
+      } else {
+        const int64_t base = input_->logical_pos();
+        const char *data = window.ptr();
+        const int64_t len = window.length();
+        int64_t i = 0;
+        while (OB_SUCC(ret) && i < len && !record_done) {
+          const char c = data[i];
+          const int64_t byte_offset = base + i;
+          bool retry = false;
+          ret = step(c, byte_offset, record_done, retry);
+          if (OB_FAIL(ret)) {
+            LOG_WARN("failed to parse json record", K(ret), K(byte_offset));
+          } else if (!retry) {
+            if ('\n' == c) {
+              ++line_;
+            }
+            ++i;
+          }
+        }
+        input_->consume(i);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (record_done) {
+      // The record is whole now, so its tokens can be pointed at: the buffer
+      // holds still and will not move again before the next call.
+      const char *base = record_buf_.ptr();
+      for (int64_t i = 0; i < members_.count(); ++i) {
+        ObJsonlMember &one = members_.at(i);
+        if (one.key_off_ >= 0) {
+          one.key_ = common::ObString(static_cast<int32_t>(one.key_len_),
+                                      const_cast<char *>(base + one.key_off_));
+        }
+        if (one.value_off_ >= 0) {
+          one.value_ = common::ObString(static_cast<int32_t>(one.value_len_),
+                                        const_cast<char *>(base + one.value_off_));
+        }
+      }
+      if (OB_FAIL(members.assign(members_))) {
+        LOG_WARN("failed to copy json members", K(ret));
+      } else {
+        state_ = BEFORE_OBJECT;
+      }
+    } else if (BEFORE_OBJECT == state_) {
+      // nothing but whitespace between the last record and the end of the file
+      ret = OB_ITER_END;
+    } else {
+      line_ = rec_start_line_;
+      ret = structural_error("json object is not complete", rec_start_off_);
+    }
+  }
+  return ret;
+}
+
+int ObJsonlScanner::build_name_order(const common::ObIArray<common::ObString> &names,
+                                     common::ObIArray<int64_t> &order)
+{
+  int ret = OB_SUCCESS;
+  order.reuse();
+  // The names are put in order as they are walked, which costs a search per
+  // column once and leaves every later key lookup searching half the list.
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    int64_t low = 0;
+    int64_t high = order.count();
+    while (low < high) {
+      const int64_t mid = low + (high - low) / 2;
+      if (compare_json_name(names.at(order.at(mid)), names.at(i)) < 0) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    if (OB_FAIL(order.push_back(0))) {
+      LOG_WARN("failed to grow json name order", K(ret), K(i));
+    } else {
+      const int64_t count = order.count();
+      for (int64_t j = count - 1; j > low; --j) {
+        order.at(j) = order.at(j - 1);
+      }
+      order.at(low) = i;
+    }
+  }
+  return ret;
+}
+
+int ObJsonlScanner::find_name(const common::ObIArray<common::ObString> &names,
+                              const common::ObIArray<int64_t> &order,
+                              const common::ObString &key,
+                              int64_t &slot)
+{
+  int ret = OB_SUCCESS;
+  slot = -1;
+  int64_t low = 0;
+  int64_t high = order.count() - 1;
+  while (-1 == slot && low <= high) {
+    const int64_t mid = low + (high - low) / 2;
+    const int64_t name_idx = order.at(mid);
+    const int compare_result = compare_json_name(key, names.at(name_idx));
+    if (0 == compare_result) {
+      slot = name_idx;
+    } else if (compare_result < 0) {
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return ret;
+}
+
+ObJsonlScanner::ObJsonlScanner()
+  : input_(NULL), columns_(NULL), names_(), name_order_(), reader_()
+{
+}
+
+ObJsonlScanner::~ObJsonlScanner()
+{
+  close();
+}
+
+int ObJsonlScanner::open(ObFileInput &input, const common::ObIArray<ObFileScanColumnDef> &columns)
+{
+  int ret = OB_SUCCESS;
+  input_ = &input;
+  columns_ = &columns;
+  names_.reuse();
+  name_order_.reuse();
+  last_err_pos_.reset();
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    if (OB_FAIL(names_.push_back(columns.at(i).column_name_))) {
+      LOG_WARN("failed to collect json column name", K(ret), K(i));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(build_name_order(names_, name_order_))) {
+    LOG_WARN("failed to order json column names", K(ret));
+  } else if (OB_FAIL(reader_.open(input))) {
+    LOG_WARN("failed to open json reader", K(ret));
+  }
+  return ret;
+}
+
+void ObJsonlScanner::close()
+{
+  reader_.close();
+  input_ = NULL;
+  columns_ = NULL;
+  names_.reuse();
+  name_order_.reuse();
+}
+
+int ObJsonlScanner::rescan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(input_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json scanner is not opened", K(ret));
+  } else if (OB_FAIL(reader_.rescan())) {
+    LOG_WARN("failed to rewind json file", K(ret));
+  } else {
+    last_err_pos_.reset();
+  }
+  return ret;
+}
+
+int ObJsonlScanner::next_row(common::ObIArray<common::ObString> &row)
+{
+  int ret = OB_SUCCESS;
+  common::ObSEArray<ObJsonlMember, 16> members;
+  common::ObSEArray<common::ObString, 16> values;
+  if (OB_FAIL(reader_.next_object(members))) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to read json object", K(ret));
+      last_err_pos_ = reader_.get_last_error_pos();
+    }
+  } else if (OB_ISNULL(columns_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json scanner is not opened", K(ret));
+  } else {
+    const int64_t column_cnt = columns_->count();
+    // a column no member names stays null, and a member no column is named for
+    // is left out: the relation has no place to put it
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+      common::ObString absent;
+      if (OB_FAIL(values.push_back(absent))) {
+        LOG_WARN("failed to reserve json column", K(ret), K(i));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
+      int64_t slot = -1;
+      if (OB_FAIL(find_name(names_, name_order_, members.at(i).key_, slot))) {
+        LOG_WARN("failed to match json member", K(ret), K(i));
+      } else if (slot < 0 || members.at(i).is_null_) {
+        // nothing to write: an unknown key or a null value both leave the slot null
+      } else {
+        values.at(slot) = members.at(i).value_;
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
+      if (OB_FAIL(row.push_back(values.at(i)))) {
+        LOG_WARN("failed to push json value", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFileScanUtils::read_json_column_names(common::ObIAllocator &alloc,
+                                            const common::ObString &real_path,
+                                            common::ObIArray<common::ObString> &names)
+{
+  int ret = OB_SUCCESS;
+  names.reuse();
+  ObFileInput input;
+  ObJsonlReader reader;
+  common::ObSEArray<ObJsonlMember, 16> members;
+  if (real_path.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid resolved path", K(ret), K(real_path));
+  } else if (OB_FAIL(input.open(alloc, real_path))) {
+    LOG_WARN("failed to open file for json keys", K(ret), K(real_path));
+  } else if (OB_FAIL(reader.open(input))) {
+    LOG_WARN("failed to open json reader", K(ret), K(real_path));
+  } else {
+    bool done = false;
+    while (OB_SUCC(ret) && !done) {
+      members.reuse();
+      if (OB_FAIL(reader.next_object(members))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          done = true;
+        } else {
+          LOG_WARN("failed to read json object", K(ret), K(real_path),
+                   "error_pos", reader.get_last_error_pos());
+        }
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
+          bool known = false;
+          for (int64_t j = 0; !known && j < names.count(); ++j) {
+            known = (0 == compare_json_name(names.at(j), members.at(i).key_));
+          }
+          common::ObString name;
+          if (known) {
+            // the key already names a column built by an earlier record
+          } else if (OB_FAIL(ob_write_string(alloc, members.at(i).key_, name))) {
+            LOG_WARN("failed to copy column name", K(ret), K(members.at(i)));
+          } else if (OB_FAIL(names.push_back(name))) {
+            LOG_WARN("failed to push column name", K(ret), K(name));
+          }
+        }
+      }
+    }
+  }
+  reader.close();
+  input.close();
+  return ret;
+}
+
+int ObFileScanUtils::infer_json_column_types(common::ObIAllocator &alloc,
+                                             const common::ObString &real_path,
+                                             const common::ObIArray<common::ObString> &names,
+                                             common::ObIArray<ObFileColumnSchema> &schema)
+{
+  int ret = OB_SUCCESS;
+  ObFileInput input;
+  ObJsonlReader reader;
+  common::ObSEArray<ObJsonlMember, 16> members;
+  common::ObSEArray<int64_t, 16> name_order;
+  common::ObSEArray<bool, 16> mentioned;
+  schema.reuse();
+  if (real_path.empty() || names.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid json schema argument", K(ret), K(real_path), "name_cnt",
+             names.count());
+  } else if (OB_FAIL(check_column_count(names.count()))) {
+    LOG_WARN("too many columns to sample", K(ret), "column_cnt", names.count());
+  } else if (OB_FAIL(ObJsonlScanner::build_name_order(names, name_order))) {
+    LOG_WARN("failed to order json column names", K(ret), K(real_path));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    ObFileColumnSchema one;
+    if (OB_FAIL(schema.push_back(one))) {
+      LOG_WARN("failed to push schema entry", K(ret), K(i));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(input.open(alloc, real_path))) {
+    LOG_WARN("failed to open file for json sampling", K(ret), K(real_path));
+  } else if (OB_FAIL(reader.open(input))) {
+    LOG_WARN("failed to open json reader for sampling", K(ret), K(real_path));
+  } else {
+    // The members are looked at as the reader left them rather than as a row,
+    // because a value the file put in quotes is a string whatever it looks like,
+    // and only the reader knows which values were quoted.
+    bool done = false;
+    while (OB_SUCC(ret) && !done) {
+      members.reuse();
+      mentioned.reuse();
+      if (OB_FAIL(reader.next_object(members))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          done = true;
+        } else {
+          LOG_WARN("failed to sample json record", K(ret), K(real_path),
+                   "error_pos", reader.get_last_error_pos());
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && !done && i < names.count(); ++i) {
+        if (OB_FAIL(mentioned.push_back(false))) {
+          LOG_WARN("failed to reserve sampled column", K(ret), K(i));
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && !done && i < members.count(); ++i) {
+        int64_t slot = -1;
+        if (OB_FAIL(ObJsonlScanner::find_name(names, name_order,
+                                              members.at(i).key_, slot))) {
+          LOG_WARN("failed to match sampled json member", K(ret), K(i));
+        } else if (slot < 0) {
+          // a key no column was built for cannot appear: the columns came from
+          // this very file, but a record is not judged by that
+        } else {
+          mentioned.at(slot) = true;
+          ObFileColumnSchema &one = schema.at(slot);
+          if (members.at(i).is_null_) {
+            one.nullable_ = true;
+          } else {
+            const common::ObString &text = members.at(i).value_;
+            const ObFileValueType type = members.at(i).is_string_
+                                         ? FILE_VALUE_VARCHAR
+                                         : ObFileValueParser::recognize(text);
+            if (FILE_VALUE_DATETIME == type) {
+              int64_t value = 0;
+              int8_t scale = 0;
+              if (ObFileValueParser::parse_datetime(text, value, scale) && scale > one.scale_) {
+                one.scale_ = scale;
+              }
+            }
+            one.type_ = ObFileValueParser::merge(one.type_, type);
+          }
+        }
+      }
+      // a record that does not mention a key leaves that column null this time
+      for (int64_t i = 0; OB_SUCC(ret) && !done && i < mentioned.count()
+           && i < schema.count(); ++i) {
+        if (!mentioned.at(i)) {
+          schema.at(i).nullable_ = true;
+        }
+      }
+    }
+  }
+  reader.close();
+  input.close();
+  // a column that never held a value is a nullable string, and only a datetime
+  // column keeps a fractional seconds scale
+  for (int64_t i = 0; OB_SUCC(ret) && i < schema.count(); ++i) {
+    if (FILE_VALUE_UNKNOWN == schema.at(i).type_) {
+      schema.at(i).type_ = FILE_VALUE_VARCHAR;
+      schema.at(i).nullable_ = true;
+    }
+    if (FILE_VALUE_DATETIME != schema.at(i).type_) {
+      schema.at(i).scale_ = 0;
+    }
+  }
+  return ret;
+}
+
 } // end namespace sql
 } // end namespace oceanbase

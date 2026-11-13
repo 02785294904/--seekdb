@@ -1721,6 +1721,20 @@ int ObStaticEngineCG::generate_spec(ObLogFileTableAccess &op,
         LOG_WARN("failed to copy real path", K(ret), K(i));
       }
     }
+    // A format that pairs a value with its column by name needs the name the
+    // file itself uses, which the resolver may have renamed for the query.
+    const int64_t name_cnt = table_def->column_source_names_.count();
+    if (OB_FAIL(ret)) {
+    } else if (0 == name_cnt) {
+    } else if (OB_FAIL(spec.column_names_.prepare_allocate(name_cnt))) {
+      LOG_WARN("failed to prepare column names", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < name_cnt; ++i) {
+      if (OB_FAIL(ob_write_string(allocator, table_def->column_source_names_.at(i),
+                                  spec.column_names_.at(i)))) {
+        LOG_WARN("failed to copy column name", K(ret), K(i));
+      }
+    }
     // A column is read out of the file only when something the operator itself
     // has to evaluate asks for it: the values it hands to its parent, its own
     // filters and its startup filters. Columns behind an expression like

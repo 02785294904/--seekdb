@@ -4564,6 +4564,14 @@ int ObFileTableDef::deep_copy(const ObFileTableDef &other, ObIAllocator *allocat
         LOG_WARN("failed to push column nullability", K(ret), K(i));
       }
     }
+    for (int64_t i = 0; OB_SUCC(ret) && i < other.column_source_names_.count(); ++i) {
+      common::ObString copied;
+      if (OB_FAIL(ob_write_string(*allocator, other.column_source_names_.at(i), copied))) {
+        LOG_WARN("failed to deep copy column key", K(ret), K(i));
+      } else if (OB_FAIL(column_source_names_.push_back(copied))) {
+        LOG_WARN("failed to push column key", K(ret), K(i));
+      }
+    }
   }
   return ret;
 }

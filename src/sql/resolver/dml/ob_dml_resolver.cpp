@@ -11215,7 +11215,9 @@ int ObDMLResolver::get_file_table_option_value(const ParseNode &value_node, ObOb
 int ObDMLResolver::resolve_file_table_options(const ParseNode &args_node, ObFileTableDef &table_def)
 {
   int ret = OB_SUCCESS;
-  const char *func_name = FILE_TABLE_GLOB == table_def.kind_ ? "glob" : "read_csv";
+  const char *func_name = FILE_TABLE_GLOB == table_def.kind_
+                          ? "glob"
+                          : (FILE_TABLE_JSON == table_def.kind_ ? "read_json" : "read_csv");
   for (int64_t i = 1; OB_SUCC(ret) && i < args_node.num_child_; ++i) {
     const ParseNode *option_node = args_node.children_[i];
     ObString option_name;
@@ -11250,6 +11252,8 @@ int ObDMLResolver::resolve_file_table_options(const ParseNode &args_node, ObFile
           const ObString format = value.get_varchar();
           const bool matched = (FILE_TABLE_CSV == table_def.kind_
                                 && format.case_compare("csv") == 0)
+                            || (FILE_TABLE_JSON == table_def.kind_
+                                && format.case_compare("newline_delimited") == 0)
                             || (FILE_TABLE_GLOB == table_def.kind_
                                 && format.case_compare("glob") == 0);
           if (!matched) {
@@ -11345,8 +11349,16 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
     }
   } else if (table_def.raw_path_.empty()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "empty path for read_csv");
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "empty path for the file table function");
     LOG_WARN("invalid path", K(ret), K(table_def));
+  } else if (FILE_TABLE_JSON == table_def.kind_) {
+    if (OB_FAIL(ObFileScanUtils::read_json_column_names(*allocator_, real_path, column_names))) {
+      LOG_WARN("failed to read json column names", K(ret), K(real_path));
+    } else if (column_names.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "json file holds no object");
+      LOG_WARN("no object in json file", K(ret), K(real_path));
+    }
   } else {
     common::ObSEArray<common::ObString, 16> fields;
     if (OB_FAIL(ObFileScanUtils::read_csv_header(*allocator_, real_path, csv_options, fields))) {
@@ -11378,6 +11390,19 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
     }
   }
   if (OB_SUCC(ret)) {
+    if (FILE_TABLE_JSON == table_def.kind_) {
+      // A JSON value finds its column through the key the file writes, and a
+      // duplicate name below renames the column without renaming the key.
+      table_def.column_source_names_.reuse();
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
+        common::ObString name;
+        if (OB_FAIL(ob_write_string(*allocator_, column_names.at(i), name))) {
+          LOG_WARN("failed to copy source column name", K(ret), K(i));
+        } else if (OB_FAIL(table_def.column_source_names_.push_back(name))) {
+          LOG_WARN("failed to push source column name", K(ret), K(i));
+        }
+      }
+    }
     // duplicate names are suffixed instead of rejected, as DuckDB does
     for (int64_t i = 1; OB_SUCC(ret) && i < column_names.count(); ++i) {
       int64_t dup_cnt = 0;
@@ -11412,6 +11437,10 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
                  *allocator_, real_path, csv_options, table_def.with_header_,
                  column_names.count(), sampled))) {
         LOG_WARN("failed to sample csv values", K(ret), K(real_path));
+      } else if (FILE_TABLE_JSON == table_def.kind_
+                 && OB_FAIL(ObFileScanUtils::infer_json_column_types(
+                        *allocator_, real_path, column_names, sampled))) {
+        LOG_WARN("failed to sample json values", K(ret), K(real_path));
       }
       table_def.column_types_.reuse();
       table_def.column_nullable_.reuse();

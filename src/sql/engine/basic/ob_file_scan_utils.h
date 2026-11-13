@@ -178,6 +178,20 @@ public:
                                     const bool with_header,
                                     const int64_t column_count,
                                     common::ObIArray<ObFileColumnSchema> &schema);
+  // Copy the keys of every object of a newline delimited JSON file into names,
+  // in the order they first appear, so that a caller outside the executor can
+  // build the relation's column list.
+  static int read_json_column_names(common::ObIAllocator &alloc,
+                                    const common::ObString &real_path,
+                                    common::ObIArray<common::ObString> &names);
+  // Walk every object of a newline delimited JSON file and derive one schema
+  // entry per named column from the values it holds; a column a record does not
+  // mention counts as a null. Objects are streamed, so only the accumulators are
+  // kept, and the values go through the same strict parsers a CSV scan uses.
+  static int infer_json_column_types(common::ObIAllocator &alloc,
+                                     const common::ObString &real_path,
+                                     const common::ObIArray<common::ObString> &names,
+                                     common::ObIArray<ObFileColumnSchema> &schema);
   // True if the path contains a glob meta character.
   static bool has_wildcard(const common::ObString &pattern);
   // Like resolve_and_check_path, but the target has to be a directory. Used to
@@ -346,6 +360,154 @@ private:
   int64_t rec_start_line_;
   int64_t rec_start_off_;
   DISALLOW_COPY_AND_ASSIGN(ObCsvScanner);
+};
+
+// One member of a JSON object as the reader found it. A null value carries no
+// text, every other value is text: a string with its escapes decoded, anything
+// else the exact bytes it occupies in the file. Classifying that text is then
+// the same strict job a CSV field already has, except that a quoted string is
+// always a string: a key whose value the file wrote as "01234" holds text that
+// looks like a number but is not one.
+struct ObJsonlMember
+{
+  ObJsonlMember()
+    : key_(), value_(), is_null_(false), is_string_(false),
+      key_off_(-1), key_len_(0), value_off_(-1), value_len_(0)
+  {}
+  void reset()
+  {
+    key_.reset();
+    value_.reset();
+    is_null_ = false;
+    is_string_ = false;
+    key_off_ = -1;
+    key_len_ = 0;
+    value_off_ = -1;
+    value_len_ = 0;
+  }
+  TO_STRING_KV(K_(key), K_(value), K_(is_null), K_(is_string));
+  common::ObString key_;
+  common::ObString value_;
+  bool is_null_;
+  bool is_string_;
+  // Where the two tokens sit in the reader's record buffer. The buffer grows
+  // while a record is read, so a window taken from it before the growth would
+  // point at memory the buffer no longer uses; a token is noted as an offset
+  // and turned into a window only once the record is complete.
+  int64_t key_off_;
+  int64_t key_len_;
+  int64_t value_off_;
+  int64_t value_len_;
+};
+
+// Reader of the newline delimited JSON format: one object per record, records
+// streamed a byte at a time so only the current one is ever held. Names are
+// matched byte for byte, and a value that is not a scalar travels as its source
+// text rather than a parsed tree.
+class ObJsonlReader
+{
+public:
+  ObJsonlReader();
+  ~ObJsonlReader();
+  // The reader borrows input for its whole lifetime.
+  int open(ObFileInput &input);
+  void close();
+  // Rewind the file and restart from the first object.
+  int rescan();
+  // Members of the next object in the order the file lists them, or OB_ITER_END
+  // once the file is drained. The strings point into the reader's own buffer and
+  // stay valid until the following next_object() call.
+  int next_object(common::ObIArray<ObJsonlMember> &members);
+  const ObFileScanErrorPos &get_last_error_pos() const { return last_err_pos_; }
+private:
+  enum State
+  {
+    BEFORE_OBJECT = 0, // only whitespace may come before the next record
+    BEFORE_NAME,       // a member name or the closing brace is expected
+    IN_NAME,           // inside the quoted name of a member
+    BEFORE_COLON,      // the name is read, the colon is expected
+    BEFORE_VALUE,      // the value of a member is about to start
+    IN_STRING_VALUE,   // inside a quoted value
+    IN_PLAIN_VALUE,    // a number, true, false or null
+    IN_CONTAINER,      // a nested object or array, copied as it stands
+    AFTER_VALUE        // a comma or the closing brace is expected
+  };
+  // Where the escape machine of a quoted token stands.
+  enum Escape
+  {
+    ESC_NONE = 0,      // the next character is literal
+    ESC_CHAR,          // a backslash was read, its partner is still unread
+    ESC_DIGITS         // collecting the four hexadecimal digits of a \u
+  };
+  int step(const char c, const int64_t byte_offset, bool &record_done, bool &retry);
+  int step_string(const char c, const int64_t byte_offset, const bool is_name);
+  int step_container(const char c);
+  int push(const char c);
+  int push_code_point(const uint32_t code_point);
+  int finish_token(const bool is_name);
+  int finish_plain_value(const int64_t byte_offset);
+  int structural_error(const char *what, const int64_t byte_offset);
+  void reset_record();
+private:
+  ObFileInput *input_;
+  // Bytes of the object being read. A token is described by an offset into it,
+  // which is why the strings handed out stay valid until the next record.
+  common::ObSqlString record_buf_;
+  common::ObSEArray<ObJsonlMember, 16> members_;
+  State state_;
+  Escape escape_;
+  // Where the token currently being read begins inside record_buf_.
+  int64_t token_off_;
+  int64_t hex_value_;
+  int64_t hex_count_;
+  uint32_t high_part_;
+  // A \u that named the first half of a surrogate pair waits for its partner.
+  bool high_pending_;
+  // Nesting level inside a container value, and whether its bytes stand inside
+  // a quoted string, which may hold braces of its own.
+  int64_t depth_;
+  bool container_string_;
+  bool container_escape_;
+  int64_t line_;
+  int64_t rec_start_line_;
+  int64_t rec_start_off_;
+  ObFileScanErrorPos last_err_pos_;
+  DISALLOW_COPY_AND_ASSIGN(ObJsonlReader);
+};
+
+// Row oriented reader of one newline delimited JSON file. A record fills the row
+// by name: a column whose key the object does not mention becomes null, and a
+// key the relation has no column for is left out, which is what lets records of
+// different shapes share one relation.
+class ObJsonlScanner : public ObFileScanner
+{
+public:
+  ObJsonlScanner();
+  virtual ~ObJsonlScanner();
+  virtual int open(ObFileInput &input,
+                   const common::ObIArray<ObFileScanColumnDef> &columns) override;
+  virtual int next_row(common::ObIArray<common::ObString> &row) override;
+  virtual int rescan() override;
+  virtual void close() override;
+  // Indices into names listed in name order, built by inserting one position at
+  // a time so the caller needs no sorting of its own.
+  static int build_name_order(const common::ObIArray<common::ObString> &names,
+                              common::ObIArray<int64_t> &order);
+  // Where key belongs among names, matched byte for byte, or -1 for a key no
+  // column was built for.
+  static int find_name(const common::ObIArray<common::ObString> &names,
+                       const common::ObIArray<int64_t> &order,
+                       const common::ObString &key,
+                       int64_t &slot);
+private:
+  ObFileInput *input_;
+  const common::ObIArray<ObFileScanColumnDef> *columns_;
+  // The name of each column, and the columns listed by it. A record is laid out
+  // by key, so the key of every member has to find its column.
+  common::ObSEArray<common::ObString, 16> names_;
+  common::ObSEArray<int64_t, 16> name_order_;
+  ObJsonlReader reader_;
+  DISALLOW_COPY_AND_ASSIGN(ObJsonlScanner);
 };
 
 } // end namespace sql

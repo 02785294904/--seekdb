@@ -152,7 +152,7 @@ struct ObFileTableDef {
                K_(has_format), K_(has_sample_size), K_(sample_size), K_(column_cnt),
                K_(raw_path), K_(format), K_(real_paths), K_(delimiter), K_(quote),
                K_(escape), K_(has_nullstr), K_(nullstr), K_(column_types),
-               K_(column_nullable), K_(column_scales));
+               K_(column_nullable), K_(column_scales), K_(column_source_names));
   FileTableKind kind_;
   bool is_glob_;          // pattern came from glob() or contains a wildcard
   bool with_header_;      // first record holds the column names
@@ -178,6 +178,11 @@ struct ObFileTableDef {
   common::ObArray<int32_t, common::ModulePageAllocator, true> column_types_;
   common::ObArray<bool, common::ModulePageAllocator, true> column_nullable_;
   common::ObArray<int32_t, common::ModulePageAllocator, true> column_scales_;
+  // Names exactly as the file spells them, one per column and in column order.
+  // A JSON record is read by key, so the scan needs the key itself, while the
+  // column name SQL sees may have been suffixed because it collided with another
+  // column when compared case insensitively. Only a json table uses this.
+  common::ObArray<common::ObString, common::ModulePageAllocator, true> column_source_names_;
 };
 
 struct TableItem
