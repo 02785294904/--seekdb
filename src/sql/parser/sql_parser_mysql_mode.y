@@ -370,6 +370,7 @@ END_P SET_VAR DELIMITER
         OPTIMIZER_COSTS
 
         ORGANIZATION
+        READ_CSV READ_JSON READ_TEXT READ_PARQUET GLOB
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
 %type <node> select_stmt update_stmt delete_stmt
@@ -497,6 +498,9 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> file_table_expr file_table_function file_table_args
+%type <node> file_table_option file_table_option_name
+
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -10848,6 +10852,11 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
+
 ;
 
 tbl_name:
@@ -16624,6 +16633,88 @@ DAY
 *  JSON TABLE
 *============================================================*/
 
+file_table_expr:
+file_table_function '(' file_table_args ')' relation_name
+{
+  ParseNode *args = NULL;
+  merge_nodes(args, result, T_EXPR_LIST, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, args, $5);
+  if (result->pl_parse_info_.is_pl_parse_ && !result->pl_parse_info_.is_pl_parse_expr_) {
+    result->pl_parse_info_.is_forbid_pl_fp_ = true;
+  }
+}
+| file_table_function '(' file_table_args ')' AS relation_name
+{
+  ParseNode *args = NULL;
+  merge_nodes(args, result, T_EXPR_LIST, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, args, $6);
+  if (result->pl_parse_info_.is_pl_parse_ && !result->pl_parse_info_.is_pl_parse_expr_) {
+    result->pl_parse_info_.is_forbid_pl_fp_ = true;
+  }
+}
+| file_table_function '(' file_table_args ')' 
+{
+  ParseNode *args = NULL;
+  merge_nodes(args, result, T_EXPR_LIST, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, args, NULL);
+  if (result->pl_parse_info_.is_pl_parse_ && !result->pl_parse_info_.is_pl_parse_expr_) {
+    result->pl_parse_info_.is_forbid_pl_fp_ = true;
+  }
+}
+;
+
+file_table_function:
+READ_CSV
+{
+  make_name_node($$, result->malloc_pool_, "read_csv");
+}
+| READ_JSON
+{
+  make_name_node($$, result->malloc_pool_, "read_json");
+}
+| READ_TEXT
+{
+  make_name_node($$, result->malloc_pool_, "read_text");
+}
+| READ_PARQUET
+{
+  make_name_node($$, result->malloc_pool_, "read_parquet");
+}
+| GLOB
+{
+  make_name_node($$, result->malloc_pool_, "glob");
+}
+;
+
+file_table_args:
+STRING_VALUE
+{
+  $$ = $1;
+}
+| file_table_args ',' file_table_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+file_table_option:
+file_table_option_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_OPTION, 2, $1, $3);
+}
+;
+
+file_table_option_name:
+NAME_OB
+{
+  $$ = $1;
+}
+| unreserved_keyword
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+;
+
 json_table_expr:
 JSON_TABLE '(' simple_expr ',' literal mock_jt_on_error_on_empty COLUMNS '(' jt_column_list ')' ')' relation_name
 {
@@ -18181,6 +18272,11 @@ ACCOUNT
 |       INCONSISTENT 
 |       INDIVIDUAL
 |       HYBRID_SEARCH
+|       READ_CSV
+|       READ_JSON
+|       READ_TEXT
+|       READ_PARQUET
+|       GLOB
 ;
 
 unreserved_keyword_special:
