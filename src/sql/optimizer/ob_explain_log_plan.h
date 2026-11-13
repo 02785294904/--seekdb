@@ -22,6 +22,7 @@ namespace oceanbase
 {
 namespace sql
 {
+  class ObLogValues;
   class ObExplainLogPlan : public ObLogPlan
   {
   public:
@@ -33,6 +34,7 @@ namespace sql
     virtual int generate_normal_raw_plan() override;
   private:
     int check_explain_generate_plan_with_outline(ObLogPlan *real_plan);
+    int add_file_schema_rows(const ObDMLStmt &child_stmt, ObLogValues &values_op);
     DISALLOW_COPY_AND_ASSIGN(ObExplainLogPlan);
   };
 }

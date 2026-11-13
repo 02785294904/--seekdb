@@ -805,6 +805,9 @@ int ObDelUpdResolver::set_base_table_for_updatable_view(TableItem &table_item,
             ret = dml->is_insert_stmt() ? OB_ERR_NON_INSERTABLE_TABLE : OB_ERR_NON_UPDATABLE_TABLE;
           } else if (new_table_item->is_json_table()) {
             ret = OB_ERR_NON_INSERTABLE_TABLE;
+          } else if (new_table_item->is_file_table()) {
+            // file tables are read only views over the observer's file system
+            ret = dml->is_insert_stmt() ? OB_ERR_NON_INSERTABLE_TABLE : OB_ERR_NON_UPDATABLE_TABLE;
           } else {
             ret = OB_ERR_UNEXPECTED;
           }
@@ -891,6 +894,8 @@ int ObDelUpdResolver::set_base_table_for_view(TableItem &table_item, const bool 
       } else if (base->is_values_table()) {
         ret = OB_ERR_NON_UPDATABLE_TABLE;
       } else if (base->is_json_table()) {
+        ret = OB_ERR_NON_UPDATABLE_TABLE;
+      } else if (base->is_file_table()) {
         ret = OB_ERR_NON_UPDATABLE_TABLE;
       } else {
         ret = OB_ERR_UNEXPECTED;

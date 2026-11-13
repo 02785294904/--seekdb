@@ -32,6 +32,7 @@
 #include "sql/rewrite/ob_transformer_impl.h"
 #include "sql/rewrite/ob_transform_pre_process.h"
 #include "sql/code_generator/ob_code_generator.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/plan_cache/ob_values_table_compression.h"
 #include "sql/pl/ob_pl_resolver.h"
 #include "lib/utility/ob_smart_call.h"
@@ -271,18 +272,28 @@ int ObSql::fill_result_set(ObResultSet &result_set,
     }
     case stmt::T_EXPLAIN: {
       ObString tname = ObString::make_string("explain_table");
-      ObString cname = ObString::make_string("Query Plan");
-      field.tname_ = tname;
-      field.org_tname_ = tname;
-      field.cname_ = cname;
-      field.org_cname_ = cname;
+      // DESCRIBE of a query over a file reports the schema that file was read
+      // with, which is the six columns a describe is expected to have
+      const bool is_file_describe =
+          static_cast<const ObExplainStmt &>(basic_stmt).is_file_schema_describe();
+      const int64_t field_cnt = is_file_describe ? ObFileScanUtils::DESCRIBE_COLUMN_COUNT : 1;
       field.type_.set_type(ObVarcharType);
       field.charsetnr_ = CS_TYPE_UTF8MB4_GENERAL_CI;
       field.type_.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
       field.type_.set_collation_level(CS_LEVEL_IMPLICIT);
       field.type_.set_varchar(type_name);
-      if (OB_FAIL(result_set.reserve_field_columns(1))) {
-      } else if (OB_FAIL(result_set.add_field_column(field))) {
+      field.tname_ = tname;
+      field.org_tname_ = tname;
+      if (OB_FAIL(result_set.reserve_field_columns(field_cnt))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < field_cnt; ++i) {
+        const ObString cname = is_file_describe
+            ? ObString::make_string(ObFileScanUtils::describe_column_name(i))
+            : ObString::make_string("Query Plan");
+        field.cname_ = cname;
+        field.org_cname_ = cname;
+        if (OB_FAIL(result_set.add_field_column(field))) {
+        }
       }
       break;
     }
@@ -3529,6 +3540,10 @@ int ObSql::need_add_plan(const ObPlanCacheCtx &pc_ctx,
              || OB_ISNULL(result.get_exec_context().get_stmt_factory()->get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()) {
+    need_add_plan = false;
+  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_file_table()) {
+    // a file table plan carries the files it discovered at resolve time: caching it
+    // would let a same shaped query over another file read the wrong one
     need_add_plan = false;
   }
   return ret;

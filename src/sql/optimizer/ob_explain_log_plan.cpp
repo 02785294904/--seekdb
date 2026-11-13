@@ -18,6 +18,7 @@
 #include "sql/optimizer/ob_explain_log_plan.h"
 #include "sql/optimizer/ob_log_values.h"
 #include "sql/code_generator/ob_code_generator.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -69,13 +70,21 @@ int ObExplainLogPlan::generate_normal_raw_plan()
       ObSEArray<common::ObString, 64> plan_strs;
       const ObString& into_table = explain_stmt->get_into_table();
       const ObString& statement_id = explain_stmt->get_statement_id();
-      if (OB_FAIL(sql_plan.store_sql_plan_for_explain(get_optimizer_context().get_exec_ctx(),
+      if (explain_stmt->is_file_schema_describe()) {
+        // a file carries no stored schema: DESCRIBE answers with the one its
+        // contents were read with, and no plan text is produced
+        if (OB_FAIL(add_file_schema_rows(*child_stmt, *values_op))) {
+          LOG_WARN("failed to describe the file table", K(ret));
+        }
+      } else if (OB_FAIL(sql_plan.store_sql_plan_for_explain(get_optimizer_context().get_exec_ctx(),
                                                       child_plan,
                                                       explain_stmt->get_explain_type(),
                                                       0 == into_table.length() ? "PLAN_TABLE" : into_table,
                                                       0 == statement_id.length() ? "" : statement_id,
                                                       explain_stmt->get_display_opt(),
                                                       plan_strs))) {
+      }
+      if (OB_FAIL(ret)) {
       } else {
         //For explain stmt, we can do pack at the stage of expr alloc,
         //But we need to use the FALSE flag to tell the driver 
@@ -98,12 +107,75 @@ int ObExplainLogPlan::generate_normal_raw_plan()
       }
     }
     get_optimizer_context().get_all_exprs().reuse();
+    // one const output expression per reported column, so that the values
+    // operator hands over exactly as many cells as the result set has fields
+    const int64_t output_cnt = explain_stmt->is_file_schema_describe()
+                               ? ObFileScanUtils::DESCRIBE_COLUMN_COUNT : 1;
+    for (int64_t i = 0; OB_SUCC(ret) && i < output_cnt; ++i) {
+      if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
+        LOG_WARN("failed to allocate values output expr", K(ret), K(i));
+      }
+    }
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
     } else {
       get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             false);
+    }
+  }
+  return ret;
+}
+
+// One row per column of the file, in the order the file holds them, typed by the
+// same inference that resolved the table. A file has no index, no declared
+// default and nothing to report as extra, so those three come back unknown.
+int ObExplainLogPlan::add_file_schema_rows(const ObDMLStmt &child_stmt,
+                                           ObLogValues &values_op)
+{
+  int ret = OB_SUCCESS;
+  const TableItem *file_table = NULL;
+  const ObIArray<TableItem*> &table_items = child_stmt.get_table_items();
+  for (int64_t i = 0; OB_ISNULL(file_table) && i < table_items.count(); ++i) {
+    if (OB_NOT_NULL(table_items.at(i)) && table_items.at(i)->is_file_table()) {
+      file_table = table_items.at(i);
+    }
+  }
+  const ObFileTableDef *table_def = OB_ISNULL(file_table)
+                                    ? NULL : file_table->get_file_table_def();
+  ObSEArray<ObColumnRefRawExpr*, 16> columns;
+  if (OB_ISNULL(table_def)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("no file table to describe", K(ret));
+  } else if (OB_FAIL(child_stmt.get_column_exprs(file_table->table_id_, columns))) {
+    LOG_WARN("failed to get the columns of the file table", K(ret));
+  } else if (OB_UNLIKELY(columns.count() != table_def->column_types_.count()
+                         || columns.count() != table_def->column_nullable_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("inferred schema does not match the file table", K(ret), K(columns.count()),
+             "type count", table_def->column_types_.count(),
+             "nullable count", table_def->column_nullable_.count());
+  }
+  const int64_t field_cnt = ObFileScanUtils::DESCRIBE_COLUMN_COUNT;
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    if (OB_ISNULL(columns.at(i))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing column expr of the file table", K(ret), K(i));
+    } else {
+      ObObj objs[field_cnt];
+      ObNewRow row;
+      objs[0].set_varchar(columns.at(i)->get_column_name());
+      objs[1].set_varchar(ObString::make_string(ObFileValueParser::type_name(
+          static_cast<ObFileValueType>(table_def->column_types_.at(i)))));
+      objs[2].set_varchar(table_def->column_nullable_.at(i)
+                          ? ObString::make_string("YES") : ObString::make_string("NO"));
+      for (int64_t j = 3; j < field_cnt; ++j) {
+        objs[j].set_null();
+      }
+      row.cells_ = objs;
+      row.count_ = field_cnt;
+      if (OB_FAIL(values_op.add_row(row))) {
+        LOG_WARN("failed to add the described column", K(ret), K(i));
+      }
     }
   }
   return ret;

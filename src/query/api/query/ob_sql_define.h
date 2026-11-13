@@ -113,8 +113,25 @@ enum PathType
   FUNCTION_TABLE_ACCESS,
   TEMP_TABLE_ACCESS,
   JSON_TABLE_ACCESS,
-  VALUES_TABLE_ACCESS
+  VALUES_TABLE_ACCESS,
+  FILE_TABLE_ACCESS
 };
+
+// Which file_table_function a file table item came from.
+enum FileTableKind
+{
+  FILE_TABLE_NONE = 0,
+  FILE_TABLE_CSV,
+  FILE_TABLE_JSON,
+  FILE_TABLE_TEXT,
+  FILE_TABLE_PARQUET,
+  FILE_TABLE_GLOB
+};
+
+static inline bool is_file_table_kind_supported(const FileTableKind kind)
+{
+  return FILE_TABLE_CSV == kind || FILE_TABLE_GLOB == kind;
+}
 
 enum JtColType {
   INVALID_COL_TYPE = 0,

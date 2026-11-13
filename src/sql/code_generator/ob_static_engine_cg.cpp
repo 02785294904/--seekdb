@@ -102,6 +102,8 @@
 #include "sql/engine/expand/ob_expand_vec_op.h"
 #include "sql/optimizer/ob_log_values_table_access.h"
 #include "sql/engine/basic/ob_values_table_access_op.h"
+#include "sql/optimizer/ob_log_file_table_access.h"
+#include "sql/engine/basic/ob_file_table_access_op.h"
 
 namespace oceanbase
 {
@@ -1679,6 +1681,62 @@ int ObStaticEngineCG::generate_spec(ObLogExprValues &op,
     }
   }
 
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(ObLogFileTableAccess &op,
+                                    ObFileTableAccessSpec &spec,
+                                    const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  const ObFileTableDef *table_def = NULL;
+  if (OB_ISNULL(table_def = op.get_file_table_def()) ||
+      OB_UNLIKELY(op.get_output_exprs().empty()) ||
+      OB_UNLIKELY(table_def->real_paths_.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid file table op", K(ret), KP(table_def));
+  } else {
+    ObIAllocator &allocator = phy_plan_->get_allocator();
+    spec.kind_ = static_cast<int32_t>(table_def->kind_);
+    spec.is_glob_ = table_def->is_glob_;
+    spec.with_header_ = table_def->with_header_;
+    spec.delimiter_ = table_def->delimiter_;
+    spec.quote_ = table_def->quote_;
+    spec.escape_ = table_def->escape_;
+    spec.has_nullstr_ = table_def->has_nullstr_;
+    if (OB_FAIL(ob_write_string(allocator, table_def->raw_path_, spec.raw_path_))) {
+      LOG_WARN("failed to copy raw path", K(ret));
+    } else if (table_def->has_nullstr_
+               && OB_FAIL(ob_write_string(allocator, table_def->nullstr_, spec.nullstr_))) {
+      LOG_WARN("failed to copy nullstr", K(ret));
+    } else if (OB_FAIL(spec.real_paths_.prepare_allocate(table_def->real_paths_.count()))) {
+      LOG_WARN("failed to prepare real paths", K(ret));
+    } else if (OB_FAIL(spec.column_exprs_.prepare_allocate(op.get_column_exprs().count()))) {
+      LOG_WARN("failed to prepare column exprs", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_def->real_paths_.count(); ++i) {
+      if (OB_FAIL(ob_write_string(allocator, table_def->real_paths_.at(i),
+                                  spec.real_paths_.at(i)))) {
+        LOG_WARN("failed to copy real path", K(ret), K(i));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_exprs().count(); i++) {
+      ObColumnRefRawExpr *col_expr = op.get_column_exprs().at(i);
+      ObExpr *expr = NULL;
+      if (OB_ISNULL(col_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(mark_expr_self_produced(col_expr))) {
+        LOG_WARN("failed to mark self produced", K(ret), K(i));
+      } else if (OB_FAIL(generate_rt_expr(*col_expr, expr))) {
+        LOG_WARN("failed to generate rt expr", K(ret), K(i));
+      } else if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        spec.column_exprs_.at(i) = expr;
+      }
+    }
+  }
   return ret;
 }
 
@@ -6149,6 +6207,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_VALUES_TABLE_ACCESS: {
       type = PHY_VALUES_TABLE_ACCESS;
+      break;
+    }
+    case log_op_def::LOG_FILE_TABLE_ACCESS: {
+      type = PHY_FILE_TABLE_ACCESS;
       break;
     }
     case log_op_def::LOG_EXPAND: {

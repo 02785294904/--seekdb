@@ -57,6 +57,12 @@ public:
   virtual bool is_affect_found_rows() const { return is_select_explain(); }
   bool is_explain_extended() const { return EXPLAIN_EXTENDED == format_
                                             || EXPLAIN_EXTENDED_NOADDR == format_; }
+  // DESCRIBE of a query over a file table reports the schema the file was read
+  // with instead of a plan; the grammar cannot tell DESCRIBE from EXPLAIN, so
+  // the resolver decides and records the answer here for plan generation and
+  // for the result fields.
+  void set_is_file_schema_describe(const bool is_describe) { is_file_schema_describe_ = is_describe; }
+  bool is_file_schema_describe() const { return is_file_schema_describe_; }
 
   DECLARE_VIRTUAL_TO_STRING;
 private:
@@ -66,6 +72,7 @@ private:
   ObDMLStmt *explain_query_stmt_;
   common::ObString into_table_;
   common::ObString statement_id_;
+  bool is_file_schema_describe_;
   DISALLOW_COPY_AND_ASSIGN(ObExplainStmt);
 };
 

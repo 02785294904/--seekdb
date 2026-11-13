@@ -1659,6 +1659,15 @@ int ObSelectResolver::expand_target_list(
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(append(column_items, get_stmt()->get_column_items()))) {
     }
+  } else if (table_item.is_file_table()) {
+    if (OB_ISNULL(get_stmt())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(get_stmt()->get_column_items(table_item.table_id_, column_items))) {
+      LOG_WARN("failed to get file table column items", K(ret));
+    } else if (OB_UNLIKELY(column_items.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("file table has no column", K(ret));
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
   }

@@ -26,6 +26,68 @@ const static int64_t EXPLAIN_DISPLAY_OPTION = 1;
 const static int64_t EXPLAIN_INTO_TABLE = 2;
 const static int64_t EXPLAIN_STMT_ID = 3;
 const static int64_t EXPLAIN_CHILD_STMT = 4;
+
+static bool is_word_char(const char ch)
+{
+  return ('a' <= ch && ch <= 'z')
+         || ('A' <= ch && ch <= 'Z')
+         || ('0' <= ch && ch <= '9')
+         || '_' == ch
+         || '$' == ch;
+}
+
+// The whole keyword must match and must not continue into an identifier, so
+// that "desc" cannot be found inside "description".
+static bool is_keyword_at(const ObString &sql, const int64_t pos, const char *keyword)
+{
+  bool matched = true;
+  const int64_t kw_len = static_cast<int64_t>(::strlen(keyword));
+  if (sql.length() < pos + kw_len) {
+    matched = false;
+  }
+  for (int64_t i = 0; matched && i < kw_len; ++i) {
+    const char ch = sql.ptr()[pos + i];
+    const char lower = ('A' <= ch && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+    matched = (keyword[i] == lower);
+  }
+  if (matched && sql.length() > pos + kw_len && is_word_char(sql.ptr()[pos + kw_len])) {
+    matched = false;
+  }
+  return matched;
+}
+
+// The grammar shares one rule between EXPLAIN, DESCRIBE and DESC and drops the
+// keyword, so the statement text is the only place the answer is still there.
+static bool starts_with_describe_keyword(const ObString &sql)
+{
+  bool is_describe = false;
+  int64_t pos = 0;
+  while (pos < sql.length()
+         && (' ' == sql.ptr()[pos] || '\t' == sql.ptr()[pos]
+             || '\n' == sql.ptr()[pos] || '\r' == sql.ptr()[pos])) {
+    ++pos;
+  }
+  if (pos < sql.length()) {
+    is_describe = is_keyword_at(sql, pos, "describe")
+                  || is_keyword_at(sql, pos, "desc");
+  }
+  return is_describe;
+}
+
+// Only a query that reads a file has a schema worth describing. Every other
+// statement keeps answering DESCRIBE with the plan, exactly as it did before.
+static bool has_file_table(const ObDMLStmt *stmt)
+{
+  bool exist = false;
+  if (OB_NOT_NULL(stmt)) {
+    const ObIArray<TableItem*> &table_items = stmt->get_table_items();
+    for (int64_t i = 0; !exist && i < table_items.count(); ++i) {
+      exist = OB_NOT_NULL(table_items.at(i)) && table_items.at(i)->is_file_table();
+    }
+  }
+  return exist;
+}
+
 int ObExplainResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
@@ -140,6 +202,11 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
     if (OB_SUCC(ret) && NULL != statement_id_node) {
       ObString statement_id(statement_id_node->str_len_, statement_id_node->str_value_);
       explain_stmt->set_statement_id(statement_id);
+    }
+    if (OB_SUCC(ret)) {
+      explain_stmt->set_is_file_schema_describe(
+          starts_with_describe_keyword(params_.cur_sql_)
+          && has_file_table(explain_stmt->get_explain_query_stmt()));
     }
   }
 
