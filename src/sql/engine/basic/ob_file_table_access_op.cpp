@@ -148,16 +148,22 @@ int ObFileTableAccessOp::inner_rescan()
 
 int ObFileTableAccessOp::switch_iterator()
 {
+  // A file list is iterated once per rescan, so like the other table functions
+  // this answers "any further iterator?" with OB_ITER_END. The list is still
+  // rewound here, so whoever rescans afterwards sees the first file again.
   int ret = OB_SUCCESS;
   file_idx_ = 0;
-  if (OB_FAIL(ObOperator::inner_switch_iterator())) {
-    LOG_WARN("failed to switch iterator", K(ret));
-  } else if (FILE_TABLE_GLOB != MY_SPEC.kind_) {
+  if (FILE_TABLE_GLOB != MY_SPEC.kind_) {
     if (OB_FAIL(close_current_file())) {
       LOG_WARN("failed to close file", K(ret));
     } else if (OB_FAIL(open_current_file())) {
       LOG_WARN("failed to reopen file", K(ret));
     }
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    clear_batch_end_flag();
+    ret = OB_ITER_END;
   }
   return ret;
 }
@@ -215,8 +221,9 @@ int ObFileTableAccessOp::write_row(const common::ObIArray<common::ObString> &row
   for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
     ObExpr *expr = MY_SPEC.column_exprs_.at(i);
     if (OB_ISNULL(expr)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("column expr is null", K(ret), K(i));
+      // a column the query does not read; the field is still parsed, because the
+      // reader has to walk past it to reach the ones behind it, but nothing is
+      // converted or copied for it
     } else {
       // no reset(): locate_datum_for_write points ptr_ at the reserved result
       // buffer of this slot, and ObDatum has no inline storage to fall back on

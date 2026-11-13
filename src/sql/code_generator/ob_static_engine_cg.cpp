@@ -1721,6 +1721,21 @@ int ObStaticEngineCG::generate_spec(ObLogFileTableAccess &op,
         LOG_WARN("failed to copy real path", K(ret), K(i));
       }
     }
+    // A column is read out of the file only when something the operator itself
+    // has to evaluate asks for it: the values it hands to its parent, its own
+    // filters and its startup filters. Columns behind an expression like
+    // replace(note, ...) count too, because that expression is evaluated here.
+    // Everything else keeps its slot in the list, since the number of slots is
+    // the width of a record, but gets no expression and the scan leaves it be.
+    ObSEArray<ObRawExpr *, 16> used_cols;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(op.get_output_exprs(), used_cols))) {
+      LOG_WARN("failed to extract output columns", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(op.get_filter_exprs(), used_cols))) {
+      LOG_WARN("failed to extract filter columns", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(op.get_startup_exprs(), used_cols))) {
+      LOG_WARN("failed to extract startup columns", K(ret));
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_exprs().count(); i++) {
       ObColumnRefRawExpr *col_expr = op.get_column_exprs().at(i);
       ObExpr *expr = NULL;
@@ -1732,7 +1747,7 @@ int ObStaticEngineCG::generate_spec(ObLogFileTableAccess &op,
         LOG_WARN("failed to generate rt expr", K(ret), K(i));
       } else if (OB_ISNULL(expr)) {
         ret = OB_ERR_UNEXPECTED;
-      } else {
+      } else if (ObOptimizerUtil::find_item(used_cols, col_expr)) {
         spec.column_exprs_.at(i) = expr;
       }
     }

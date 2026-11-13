@@ -326,7 +326,7 @@ REGISTER_OPERATOR(ObLogValuesTableAccess, PHY_VALUES_TABLE_ACCESS, ObValuesTable
 class ObLogFileTableAccess;
 class ObFileTableAccessSpec;
 class ObFileTableAccessOp;
-REGISTER_OPERATOR(ObLogFileTableAccess, PHY_FILE_TABLE_ACCESS, ObFileTableAccessSpec, ObFileTableAccessOp, NOINPUT);
+REGISTER_OPERATOR(ObLogFileTableAccess, PHY_FILE_TABLE_ACCESS, ObFileTableAccessSpec, ObFileTableAccessOp, NOINPUT, VECTORIZED_OP);
 
 class ObLogDelete;
 class ObTableDeleteSpec;
