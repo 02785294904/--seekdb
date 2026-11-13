@@ -253,10 +253,20 @@ int ObFileScanUtils::list_matching_files(
             const common::ObString raw_match(STRLEN(match), const_cast<char *>(match));
             char resolved_buf[PATH_MAX];
             common::ObString real_path;
-            if (OB_FAIL(resolve_and_check_path(raw_match, secure_file_priv, skip_priv_check,
-                                               resolved_buf, sizeof(resolved_buf), real_path))) {
-              // a match outside the boundary or not a regular file is not readable
-              LOG_WARN("skip or fail on matched file", K(ret), K(raw_match));
+            // a meta character asks for whatever files the pattern names, so a
+            // match that turns out to be a directory, a link leading outside the
+            // boundary or a file removed in the meantime is not a failure of the
+            // query: it is one of the names that has no readable file behind it.
+            // Anything else, an over long path or an allocation that did not fit,
+            // is a real error and stops the expansion.
+            const int check_ret = resolve_and_check_path(raw_match, secure_file_priv,
+                                                         skip_priv_check, resolved_buf,
+                                                         sizeof(resolved_buf), real_path);
+            if (OB_FILE_NOT_EXIST == check_ret || OB_INVALID_ARGUMENT == check_ret
+                || OB_ERR_NO_PRIVILEGE == check_ret) {
+              LOG_TRACE("skip unreadable glob match", K(check_ret), K(raw_match));
+            } else if (OB_FAIL(check_ret)) {
+              LOG_WARN("failed to check matched file", K(check_ret), K(raw_match));
             } else if (OB_FAIL(ob_write_string(alloc, real_path, real_path))) {
               LOG_WARN("failed to copy matched path", K(ret), K(real_path));
             } else if (OB_FAIL(files.push_back(real_path))) {
