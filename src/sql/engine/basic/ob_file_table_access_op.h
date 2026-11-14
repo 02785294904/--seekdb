@@ -72,7 +72,7 @@ private:
   int prepare_scan();
   int open_current_file();
   int close_current_file();
-  // The reader of the format this table was resolved from. Both live in the
+  // The reader of the format this table was resolved from. All three live in the
   // operator, so no allocation happens per file.
   ObFileScanner *cur_scanner();
   int next_record(common::ObIArray<common::ObString> &row);
@@ -84,6 +84,7 @@ private:
   ObFileInput file_input_;
   ObCsvScanner csv_scanner_;
   ObJsonlScanner json_scanner_;
+  ObParquetScanner parquet_scanner_;
   bool scan_ready_;
   int64_t file_idx_;
   DISALLOW_COPY_AND_ASSIGN(ObFileTableAccessOp);

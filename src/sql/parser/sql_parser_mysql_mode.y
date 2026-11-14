@@ -500,6 +500,7 @@ END_P SET_VAR DELIMITER
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> file_table_expr file_table_function file_table_args
 %type <node> file_table_option file_table_option_name
+%type <node> copy_stmt copy_option copy_option_list copy_option_value opt_copy_options
 
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
@@ -560,6 +561,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -16706,6 +16708,93 @@ file_table_option_name COMP_EQ expr
 
 file_table_option_name:
 NAME_OB
+{
+  $$ = $1;
+}
+| unreserved_keyword
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+;
+
+/* COPY (query) TO 'file' (option ...) writes the rows of the query through the
+ * machinery of SELECT ... INTO OUTFILE, so the query keeps its own parse tree
+ * and carries the statement as the extra into child the resolver looks for. */
+copy_stmt:
+COPY '(' select_no_parens ')' TO STRING_VALUE opt_copy_options
+{
+  ParseNode *opts = NULL;
+  ParseNode *copy_node = NULL;
+  if (NULL != $7) {
+    merge_nodes(opts, result, T_EXPR_LIST, $7);
+  }
+  malloc_non_terminal_node(copy_node, result->malloc_pool_, T_FILE_TABLE_COPY, 2, $6, opts);
+  if (NULL != $3->children_[PARSE_SELECT_INTO]
+      || NULL != $3->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "");
+    YYERROR;
+  }
+  $3->children_[PARSE_SELECT_INTO_EXTRA] = copy_node;
+  $$ = $3;
+}
+;
+
+/* a copy with nothing written behind the file name takes every default */
+opt_copy_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| '(' ')'
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  $$ = $2;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+file_table_option_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_OPTION, 2, $1, NULL);
+}
+| file_table_option_name copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_OPTION, 2, $1, $2);
+}
+| file_table_option_name COMP_EQ copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_OPTION, 2, $1, $3);
+}
+;
+
+copy_option_value:
+STRING_VALUE
+{
+  $$ = $1;
+}
+| NAME_OB
+{
+  $$ = $1;
+}
+| BOOL_VALUE
+{
+  $$ = $1;
+}
+| INTNUM
 {
   $$ = $1;
 }

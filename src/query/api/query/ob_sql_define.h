@@ -130,7 +130,8 @@ enum FileTableKind
 
 static inline bool is_file_table_kind_supported(const FileTableKind kind)
 {
-  return FILE_TABLE_CSV == kind || FILE_TABLE_JSON == kind || FILE_TABLE_GLOB == kind;
+  return FILE_TABLE_CSV == kind || FILE_TABLE_JSON == kind
+      || FILE_TABLE_PARQUET == kind || FILE_TABLE_GLOB == kind;
 }
 
 enum JtColType {

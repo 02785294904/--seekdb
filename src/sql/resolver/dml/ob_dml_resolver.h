@@ -780,7 +780,6 @@ private:
   int resolve_values_table_item(const ParseNode &table_node, TableItem *&table_item);
   int resolve_file_table_item(const ParseNode &table_node, TableItem *&table_item);
   int get_file_table_kind(const common::ObString &func_name, FileTableKind &kind);
-  int get_file_table_option_value(const ParseNode &value_node, common::ObObj &value);
   int get_file_table_path(const ParseNode &path_node, common::ObString &path);
   int resolve_file_table_options(const ParseNode &args_node, ObFileTableDef &table_def);
   int infer_file_table_schema(ObFileTableDef &table_def,
@@ -818,6 +817,8 @@ private:
   int add_obj_to_llc_bitmap(const ObObj &obj, char *llc_bitmap, double &num_null);
   int compute_values_table_row_count(ObValuesTableDef &table_def);
 protected:
+  // a copy writes its option list through the same literal rules as a file table
+  int get_file_table_option_value(const ParseNode &value_node, common::ObObj &value);
   struct GenColumnExprInfo {
     GenColumnExprInfo():
       dependent_expr_(NULL),

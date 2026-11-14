@@ -11175,7 +11175,9 @@ int ObDMLResolver::get_file_table_option_value(const ParseNode &value_node, ObOb
   value.reset();
   if (T_BOOL == value_node.type_ || T_INT == value_node.type_) {
     value.set_int(value_node.value_);
-  } else if (T_VARCHAR == value_node.type_ || T_CHAR == value_node.type_) {
+  } else if (T_VARCHAR == value_node.type_ || T_CHAR == value_node.type_
+             || T_IDENT == value_node.type_) {
+    // an option written without quotes, like `format csv`, reaches us as a name
     if (OB_ISNULL(value_node.str_value_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -11217,7 +11219,9 @@ int ObDMLResolver::resolve_file_table_options(const ParseNode &args_node, ObFile
   int ret = OB_SUCCESS;
   const char *func_name = FILE_TABLE_GLOB == table_def.kind_
                           ? "glob"
-                          : (FILE_TABLE_JSON == table_def.kind_ ? "read_json" : "read_csv");
+                          : (FILE_TABLE_JSON == table_def.kind_ ? "read_json"
+                             : (FILE_TABLE_PARQUET == table_def.kind_
+                                ? "read_parquet" : "read_csv"));
   for (int64_t i = 1; OB_SUCC(ret) && i < args_node.num_child_; ++i) {
     const ParseNode *option_node = args_node.children_[i];
     ObString option_name;
@@ -11254,6 +11258,8 @@ int ObDMLResolver::resolve_file_table_options(const ParseNode &args_node, ObFile
                                 && format.case_compare("csv") == 0)
                             || (FILE_TABLE_JSON == table_def.kind_
                                 && format.case_compare("newline_delimited") == 0)
+                            || (FILE_TABLE_PARQUET == table_def.kind_
+                                && format.case_compare("parquet") == 0)
                             || (FILE_TABLE_GLOB == table_def.kind_
                                 && format.case_compare("glob") == 0);
           if (!matched) {
@@ -11334,6 +11340,10 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
 {
   int ret = OB_SUCCESS;
   ObCsvScanOptions csv_options;
+  // The type of every column, filled either by the schema the file declares or
+  // by the values sampled from it below; a file that declares nothing leaves it
+  // empty and its columns fall back to strings.
+  common::ObSEArray<ObFileColumnSchema, 16> declared;
   column_names.reuse();
   csv_options.delimiter_ = table_def.delimiter_;
   csv_options.quote_ = table_def.quote_;
@@ -11358,6 +11368,21 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "json file holds no object");
       LOG_WARN("no object in json file", K(ret), K(real_path));
+    }
+  } else if (FILE_TABLE_PARQUET == table_def.kind_) {
+    // A columnar file states the name and the type of every column it holds, so
+    // one read of its footer answers both, and nothing is sampled.
+    declared.reuse();
+    if (OB_FAIL(ObFileScanUtils::read_parquet_schema(*allocator_, real_path,
+                                                     column_names, declared))) {
+      if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+          && OB_SIZE_OVERFLOW != ret) {
+        LOG_WARN("failed to read parquet schema", K(ret), K(real_path));
+      }
+    } else if (column_names.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parquet file holds no column");
+      LOG_WARN("no column in parquet file", K(ret), K(real_path));
     }
   } else {
     common::ObSEArray<common::ObString, 16> fields;
@@ -11390,9 +11415,10 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
     }
   }
   if (OB_SUCC(ret)) {
-    if (FILE_TABLE_JSON == table_def.kind_) {
-      // A JSON value finds its column through the key the file writes, and a
-      // duplicate name below renames the column without renaming the key.
+    if (FILE_TABLE_JSON == table_def.kind_ || FILE_TABLE_PARQUET == table_def.kind_) {
+      // A value of either format finds its column through the name the file
+      // writes it under, and a duplicate name below renames the column without
+      // renaming that name.
       table_def.column_source_names_.reuse();
       for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
         common::ObString name;
@@ -11429,17 +11455,17 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
     } else if (OB_FAIL(ObFileScanUtils::check_column_count(column_names.count()))) {
       LOG_WARN("too many columns in file", K(ret), "column_cnt", column_names.count());
     } else {
-      // Only a csv file has values to look at; glob() hands out names and reads
-      // nothing, so its single column stays a string.
-      common::ObSEArray<ObFileColumnSchema, 16> sampled;
+      // Only a row oriented file has values to look at; glob() hands out names
+      // and reads nothing, so its single column stays a string, and a columnar
+      // file was already typed by the schema above.
       if (FILE_TABLE_CSV == table_def.kind_
           && OB_FAIL(ObFileScanUtils::infer_csv_column_types(
                  *allocator_, real_path, csv_options, table_def.with_header_,
-                 column_names.count(), sampled))) {
+                 column_names.count(), declared))) {
         LOG_WARN("failed to sample csv values", K(ret), K(real_path));
       } else if (FILE_TABLE_JSON == table_def.kind_
                  && OB_FAIL(ObFileScanUtils::infer_json_column_types(
-                        *allocator_, real_path, column_names, sampled))) {
+                        *allocator_, real_path, column_names, declared))) {
         LOG_WARN("failed to sample json values", K(ret), K(real_path));
       }
       table_def.column_types_.reuse();
@@ -11447,8 +11473,8 @@ int ObDMLResolver::infer_file_table_schema(ObFileTableDef &table_def,
       table_def.column_scales_.reuse();
       for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
         ObFileColumnSchema one;
-        if (i < sampled.count()) {
-          one = sampled.at(i);
+        if (i < declared.count()) {
+          one = declared.at(i);
         } else {
           one.type_ = FILE_VALUE_VARCHAR;
           one.nullable_ = (FILE_TABLE_CSV == table_def.kind_);

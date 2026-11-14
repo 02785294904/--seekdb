@@ -38,7 +38,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, header_str_, null_str_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -148,6 +148,15 @@ void ObSelectIntoOp::set_csv_format_options()
       has_escape_ = true;
       char_escape_ = external_properties_.csv_format_.field_escaped_char_;
     }
+  }
+  // only a copy fills these in, and what it asks for is written as it stands: the
+  // labels in front of the rows and the spelling of a value that is not there
+  if (MY_SPEC.header_str_.is_varchar()) {
+    copy_header_ = MY_SPEC.header_str_.get_varchar();
+  }
+  if (MY_SPEC.null_str_.is_varchar()) {
+    has_copy_null_ = true;
+    copy_null_str_ = MY_SPEC.null_str_.get_varchar();
   }
 }
 
@@ -929,7 +938,11 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
-  if (!has_escape_) {
+  if (obj.is_null() && has_copy_null_) {
+    // a copy says how a value that is not there is spelled, and that spelling is
+    // written for what it is, without the quoting and escaping of a real value
+    OZ(write_copy_text_to_file(copy_null_str_, data_writer));
+  } else if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
     OZ(write_single_char_to_file(&char_escape_, data_writer));
@@ -939,6 +952,40 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   }
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
+  }
+  return ret;
+}
+
+/* Two pieces of a copy file come from the statement instead of from a row: the
+ * labels in front of the rows and the spelling of a value that is not there. Both
+ * go out character by character through the writer the rows use, so that they keep
+ * the order of everything else already in the buffer. */
+int ObSelectIntoOp::write_copy_text_to_file(const ObString &text, ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < text.length(); ++i) {
+    const char ch = text.ptr()[i];
+    if (OB_FAIL(write_single_char_to_file(&ch, data_writer))) {
+      LOG_WARN("failed to write a copy character", K(ret), K(i), K(text));
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::write_copy_header(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  if (copy_header_.empty()) {
+    // no labels were asked for in front of the rows
+  } else if (OB_FAIL(write_copy_text_to_file(copy_header_, data_writer))) {
+    LOG_WARN("failed to write the copy header", K(ret), K_(copy_header));
+  } else if (use_shared_buf_ && OB_FAIL(data_writer.flush_shared_buf(shared_buf_))) {
+    LOG_WARN("failed to flush the copy header", K(ret), K_(copy_header));
+  } else {
+    // the rows tell the writer where each line ends as they go, but a query that
+    // returns nothing leaves the names as the only line it will ever see, and an
+    // unfinished line is one the writer keeps holding on to
+    data_writer.update_last_line_pos();
   }
   return ret;
 }
@@ -1241,10 +1288,19 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   if (OB_FAIL(ret)) {
   } else if (T_INTO_OUTFILE == MY_SPEC.into_type_ && MY_SPEC.is_single_
              && OB_FAIL(data_writer->open_file())) {
-  } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
+  } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
     csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
-    if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+    if (MY_SPEC.buffer_size_ > 0
+        && OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
     }
+  }
+  // a copy names its columns in front of the rows, which a query that returns
+  // nothing still asks for, and the names go out once however often the writer
+  // is asked for
+  if (OB_FAIL(ret) || NULL == csv_data_writer || copy_header_written_) {
+  } else if (OB_FALSE_IT(copy_header_written_ = true)) {
+  } else if (OB_FAIL(write_copy_header(*csv_data_writer))) {
+    LOG_WARN("failed to write the copy header", K(ret));
   }
   return ret;
 }

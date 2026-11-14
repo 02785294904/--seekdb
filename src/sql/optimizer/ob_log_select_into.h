@@ -44,7 +44,9 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        header_str_(),
+        null_str_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -108,6 +110,14 @@ public:
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
   }
+  inline void set_header_str(common::ObObj &header_str)
+  {
+    header_str_ = header_str;
+  }
+  inline void set_null_str(common::ObObj &null_str)
+  {
+    null_str_ = null_str;
+  }
   inline ObItemType get_into_type() const
   {
     return into_type_;
@@ -164,6 +174,14 @@ public:
   {
     return external_properties_;
   }
+  inline common::ObObj get_header_str() const
+  {
+    return header_str_;
+  }
+  inline common::ObObj get_null_str() const
+  {
+    return null_str_;
+  }
   const common::ObIArray<ObRawExpr*> &get_select_exprs() const { return select_exprs_; }
   common::ObIArray<ObRawExpr*> &get_select_exprs() { return select_exprs_; }
   virtual int est_cost() override;
@@ -188,6 +206,10 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  // only a copy asks for these: the labels in front of the rows and the text that
+  // stands for a value that is not there
+  common::ObObj header_str_;
+  common::ObObj null_str_;
 };
 }
 }

@@ -71,7 +71,9 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      header_str_(),
+      null_str_()
   {
   }
 
@@ -91,6 +93,10 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // what a copy puts in front of the rows and what it puts for a value that is not
+  // there; both stay unset for a select into outfile, which keeps the old rules
+  common::ObObj header_str_;
+  common::ObObj null_str_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +132,11 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_header_(),
+      copy_null_str_(),
+      has_copy_null_(false),
+      copy_header_written_(false)
   {
   }
 
@@ -240,6 +250,8 @@ private:
                              int64_t &pos,
                              ObCsvFileWriter &data_writer);
   int write_single_char_to_file(const char *wchar, ObCsvFileWriter &data_writer);
+  int write_copy_text_to_file(const common::ObString &text, ObCsvFileWriter &data_writer);
+  int write_copy_header(ObCsvFileWriter &data_writer);
   int write_lob_to_file(const ObObj &obj,
                         const ObExpr &expr,
                         const ObDatum &datum,
@@ -292,6 +304,10 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  common::ObString copy_header_;
+  common::ObString copy_null_str_;
+  bool has_copy_null_;
+  bool copy_header_written_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

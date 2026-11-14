@@ -3090,6 +3090,248 @@ int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
   return ret;
 }
 
+// a header label is written quoted when reading it back would give something other
+// than the one column it names
+static bool ob_copy_label_needs_quote(const common::ObString &label,
+                                      const common::ObString &term,
+                                      const char quote)
+{
+  bool need_quote = false;
+  for (int64_t i = 0; !need_quote && i < label.length(); ++i) {
+    need_quote = (label.ptr()[i] == quote || '\n' == label.ptr()[i] || '\r' == label.ptr()[i]);
+  }
+  for (int64_t i = 0; !need_quote && i + term.length() <= label.length(); ++i) {
+    need_quote = (term.length() > 0 && 0 == MEMCMP(label.ptr() + i, term.ptr(), term.length()));
+  }
+  return need_quote;
+}
+
+static int ob_append_copy_header_field(common::ObSqlString &header,
+                                       const common::ObString &label,
+                                       const common::ObString &term,
+                                       const int64_t quote_char)
+{
+  int ret = OB_SUCCESS;
+  const char quote = static_cast<char>(quote_char);
+  const bool quoted = (INT64_MAX != quote_char)
+                      && ob_copy_label_needs_quote(label, term, quote);
+  if (quoted && OB_FAIL(header.append(&quote, 1))) {
+    LOG_WARN("failed to open a quoted copy header column", K(ret), K(label));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < label.length(); ++i) {
+    if (quoted && label.ptr()[i] == quote && OB_FAIL(header.append(&quote, 1))) {
+      LOG_WARN("failed to double a copy header quote", K(ret), K(label));
+    } else if (OB_FAIL(header.append(label.ptr() + i, 1))) {
+      LOG_WARN("failed to add a copy header character", K(ret), K(label));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (quoted && OB_FAIL(header.append(&quote, 1))) {
+    LOG_WARN("failed to close a quoted copy header column", K(ret), K(label));
+  }
+  return ret;
+}
+
+/* A copy option is a file table option written without the =, so the same literal
+ * rules read its value, and an option standing on its own means the plain true. */
+int ObSelectResolver::resolve_copy_option(const ParseNode &option_node,
+                                          ObSelectIntoItem &into_item,
+                                          ObExternalFileFormat &external_format,
+                                          bool &need_header)
+{
+  int ret = OB_SUCCESS;
+  ObString name;
+  ObObj value;
+  const ParseNode *value_node = NULL;
+  if (OB_UNLIKELY(T_FILE_TABLE_OPTION != option_node.type_ || 2 != option_node.num_child_
+                  || OB_ISNULL(option_node.children_)
+                  || OB_ISNULL(option_node.children_[0])
+                  || OB_ISNULL(option_node.children_[0]->str_value_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid copy option node", K(ret), K(option_node.type_));
+  } else {
+    name.assign_ptr(option_node.children_[0]->str_value_,
+                    static_cast<int32_t>(option_node.children_[0]->str_len_));
+    value_node = option_node.children_[1];
+    if (NULL != value_node && OB_FAIL(get_file_table_option_value(*value_node, value))) {
+      LOG_WARN("failed to read copy option value", K(ret), K(name));
+    } else if (name.case_compare("header") == 0) {
+      if (NULL == value_node) {
+        need_header = true;
+      } else if (!value.is_int()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "header option, expect a boolean value");
+      } else {
+        need_header = 0 != value.get_int();
+      }
+    } else if (name.case_compare("format") == 0) {
+      if (!value.is_varchar()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "format option, expect a string value");
+      } else if (0 != value.get_varchar().case_compare("csv")) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "format of the copy statement");
+        LOG_WARN("unsupported copy format", K(ret), "value", value);
+      }
+    } else if (name.case_compare("nullstr") == 0) {
+      if (!value.is_varchar()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "nullstr option, expect a string value");
+      } else {
+        into_item.null_str_ = value;
+      }
+    } else if (name.case_compare("delimiter") == 0 || name.case_compare("sep") == 0) {
+      if (!value.is_varchar() || value.get_varchar().empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "delimiter option, expect a non empty string");
+      } else {
+        external_format.csv_format_.field_term_str_ = value.get_varchar();
+      }
+    } else if (name.case_compare("quote") == 0 || name.case_compare("escape") == 0) {
+      const bool is_quote = name.case_compare("quote") == 0;
+      int64_t term_char = INT64_MAX; // an empty value asks for no such character
+      if (!value.is_varchar()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "quote option, expect a single character");
+      } else if (value.get_varchar().length() > 1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi character quote or escape of a copy");
+      } else if (1 == value.get_varchar().length()) {
+        term_char = static_cast<int64_t>(value.get_varchar().ptr()[0]);
+      }
+      if (OB_SUCC(ret)) {
+        if (is_quote) {
+          external_format.csv_format_.field_enclosed_char_ = term_char;
+        } else {
+          external_format.csv_format_.field_escaped_char_ = term_char;
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown option of copy statement");
+      LOG_WARN("unknown copy option", K(ret), K(name));
+    }
+  }
+  return ret;
+}
+
+/* COPY sends the rows of its query through the writer SELECT ... INTO OUTFILE
+ * already has, so the option list only has to become the CSV description that
+ * writer reads. The labels in front of the rows and the text for a value that is
+ * not there never existed in that clause, so they travel on their own. */
+int ObSelectResolver::resolve_copy_into_clause(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  bool enable_file_sql = false;
+  bool need_header = false;
+  const ParseNode *opt_list = NULL;
+  ObExternalFileFormat external_format;
+  ObSqlString header;
+  if (OB_ISNULL(allocator_) || OB_ISNULL(session_info_) || OB_ISNULL(node)
+      || OB_UNLIKELY(T_FILE_TABLE_COPY != node->type_ || 2 != node->num_child_
+                     || OB_ISNULL(node->children_) || OB_ISNULL(node->children_[0]))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid copy node", K(ret), K(node));
+  } else if (FALSE_IT(opt_list = node->children_[1])) { // a copy may name no option
+  } else if (NULL != opt_list && OB_UNLIKELY(T_EXPR_LIST != opt_list->type_
+                                             || OB_ISNULL(opt_list->children_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid copy option list", K(ret), K(opt_list));
+  } else if (OB_FAIL(session_info_->is_file_sql_enabled(enable_file_sql))) {
+    LOG_WARN("failed to read enable_file_sql", K(ret));
+  } else if (!enable_file_sql) {
+    // like the file table functions, a copy stays dark until the session turns it on
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file sql is disabled, set enable_file_sql = ON");
+    LOG_WARN("file sql is disabled", K(ret));
+  } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item.outfile_name_))) {
+    LOG_WARN("failed to resolve the copy target", K(ret));
+  } else {
+    into_item.into_type_ = T_INTO_OUTFILE;
+    // where the copy writes is frozen into this plan, so a plan built for one path
+    // must not be handed to a statement writing another
+    if (OB_NOT_NULL(params_.query_ctx_)) {
+      params_.query_ctx_->has_file_table_ = true;
+    }
+    // a copy writes what read_csv reads without options: comma separated lines, a
+    // field quoted only when it holds text, and a quote inside it doubled
+    ObDataInFileStruct data_format;
+    data_format.field_term_str_ = ObString(",");
+    data_format.line_term_str_ = ObString("\n");
+    data_format.line_start_str_ = ObString("");
+    data_format.field_escaped_char_ = static_cast<int64_t>('"');
+    data_format.field_enclosed_char_ = static_cast<int64_t>('"');
+    data_format.is_opt_field_enclosed_ = true;
+    external_format.format_type_ = ObExternalFileFormat::CSV_FORMAT;
+    const ObCollationType file_cs_type = ObCharset::get_default_collation(
+        ObCharset::charset_type_by_coll(session_info_->get_local_collation_connection()));
+    if (OB_FAIL(external_format.csv_format_.init_format(data_format, 0, file_cs_type))) {
+      LOG_WARN("failed to build the copy csv format", K(ret));
+    } else {
+      external_format.csv_format_.is_optional_ = true;
+      for (int64_t i = 0; OB_SUCC(ret) && NULL != opt_list && i < opt_list->num_child_; ++i) {
+        if (OB_ISNULL(opt_list->children_[i])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(resolve_copy_option(*opt_list->children_[i], into_item,
+                                               external_format, need_header))) {
+          LOG_WARN("failed to resolve a copy option", K(ret), K(i));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!into_item.null_str_.is_varchar()) {
+      // a copy always says what a value that is not there looks like, and without an
+      // option asking for a word of its own it simply takes the field away
+      into_item.null_str_.set_varchar("");
+      into_item.null_str_.set_collation_type(file_cs_type);
+    }
+    if (OB_FAIL(ret)) {
+    } else if (need_header) {
+      const ObSelectStmt *select_stmt = get_select_stmt();
+      if (OB_ISNULL(select_stmt)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (0 == select_stmt->get_select_items().count()) {
+        // a set query has no columns of its own to name until its branches are
+        // resolved, which happens after this clause is read
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "header of a copy over a set query");
+      } else {
+        const ObIArray<SelectItem> &items = select_stmt->get_select_items();
+        for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+          const SelectItem &item = items.at(i);
+          // an alias names the column, and otherwise the text it was written as
+          const ObString label = !item.alias_name_.empty() ? item.alias_name_ : item.expr_name_;
+          if (0 != i && OB_FAIL(header.append(external_format.csv_format_.field_term_str_))) {
+            LOG_WARN("failed to add a copy header separator", K(ret), K(i));
+          } else if (OB_FAIL(ob_append_copy_header_field(header, label,
+                                                         external_format.csv_format_.field_term_str_,
+                                                         external_format.csv_format_.field_enclosed_char_))) {
+            LOG_WARN("failed to add a copy header column", K(ret), K(i));
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(header.append(external_format.csv_format_.line_term_str_))) {
+          LOG_WARN("failed to end the copy header", K(ret));
+        } else {
+          ObString header_line;
+          if (OB_FAIL(ob_write_string(*allocator_, header.string(), header_line))) {
+            LOG_WARN("failed to keep the copy header", K(ret));
+          } else {
+            into_item.header_str_.set_varchar(header_line);
+            into_item.header_str_.set_collation_type(file_cs_type);
+          }
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(external_format.to_string_with_alloc(into_item.external_properties_,
+                                                             *allocator_, true))) {
+      LOG_WARN("failed to keep the copy csv format", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_clause(const ParseNode *node)
 {
   int ret = OB_SUCCESS;
@@ -3123,6 +3365,12 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
         } else { // Be compatible with grammar before
           if (OB_FAIL(resolve_into_outfile_without_format(node, *into_item))) {
           }
+        }
+      } else if (T_FILE_TABLE_COPY == node->type_) { // copy (query) to 'file' (options)
+        if (is_in_set_query()) {
+          ret = OB_INAPPROPRIATE_INTO;
+        } else if (OB_FAIL(resolve_copy_into_clause(node, *into_item))) {
+          LOG_WARN("failed to resolve copy clause", K(ret));
         }
       } else if (T_INTO_DUMPFILE  == node->type_) { // into dumpfile
         if (is_in_set_query()) {

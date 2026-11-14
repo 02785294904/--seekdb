@@ -48,6 +48,7 @@ ObFileTableAccessOp::ObFileTableAccessOp(ObExecContext &exec_ctx,
     file_input_(),
     csv_scanner_(),
     json_scanner_(),
+    parquet_scanner_(),
     scan_ready_(false),
     file_idx_(0)
 {
@@ -56,11 +57,14 @@ ObFileTableAccessOp::ObFileTableAccessOp(ObExecContext &exec_ctx,
 int ObFileTableAccessOp::prepare_scan()
 {
   int ret = OB_SUCCESS;
-  const bool by_name = (FILE_TABLE_JSON == MY_SPEC.kind_);
+  // A value of these two formats is laid out by the name the file writes it
+  // under, so the scanner has to be told what every column is called.
+  const bool by_name = (FILE_TABLE_JSON == MY_SPEC.kind_
+                        || FILE_TABLE_PARQUET == MY_SPEC.kind_);
   column_defs_.reuse();
   if (by_name && MY_SPEC.column_names_.count() != MY_SPEC.column_exprs_.count()) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("json column has no name to match", K(ret), "name_cnt",
+    LOG_WARN("file column has no name to match", K(ret), "name_cnt",
              MY_SPEC.column_names_.count(), "col_cnt", MY_SPEC.column_exprs_.count());
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
@@ -71,6 +75,9 @@ int ObFileTableAccessOp::prepare_scan()
     def.meta_.set_type(OB_ISNULL(expr) ? ObVarcharType : expr->datum_meta_.type_);
     def.meta_.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
     def.is_nullable_ = true;
+    // a column no expression reads still has its field parsed out of a record,
+    // but a columnar reader can leave the pages that hold it alone entirely
+    def.projected_ = (NULL != expr);
     if (by_name) {
       // a value finds its column through the key the file writes it under
       def.column_name_ = MY_SPEC.column_names_.at(i);
@@ -97,6 +104,8 @@ ObFileScanner *ObFileTableAccessOp::cur_scanner()
   ObFileScanner *scanner = NULL;
   if (FILE_TABLE_JSON == MY_SPEC.kind_) {
     scanner = &json_scanner_;
+  } else if (FILE_TABLE_PARQUET == MY_SPEC.kind_) {
+    scanner = &parquet_scanner_;
   } else {
     scanner = &csv_scanner_;
   }
@@ -123,6 +132,7 @@ int ObFileTableAccessOp::close_current_file()
   int ret = OB_SUCCESS;
   csv_scanner_.close();
   json_scanner_.close();
+  parquet_scanner_.close();
   file_input_.close();
   file_alloc_.reset();
   return ret;
@@ -142,7 +152,8 @@ int ObFileTableAccessOp::inner_open()
   } else if (FILE_TABLE_GLOB == MY_SPEC.kind_) {
     // glob() lists the resolved paths, the files themselves are never opened
     scan_ready_ = true;
-  } else if (FILE_TABLE_CSV != MY_SPEC.kind_ && FILE_TABLE_JSON != MY_SPEC.kind_) {
+  } else if (FILE_TABLE_CSV != MY_SPEC.kind_ && FILE_TABLE_JSON != MY_SPEC.kind_
+             && FILE_TABLE_PARQUET != MY_SPEC.kind_) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file format of the file table function");
     LOG_WARN("unsupported file table kind", K(ret), "kind", MY_SPEC.kind_);
@@ -428,6 +439,7 @@ void ObFileTableAccessOp::destroy()
 {
   csv_scanner_.close();
   json_scanner_.close();
+  parquet_scanner_.close();
   file_input_.close();
   file_alloc_.reset();
   scan_ready_ = false;

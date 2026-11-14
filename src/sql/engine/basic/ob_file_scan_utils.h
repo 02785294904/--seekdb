@@ -40,6 +40,9 @@ struct ObFileScanLimits
   static constexpr int64_t MAX_RECORD_LENGTH = 8 * 1024 * 1024;
   static constexpr int64_t MAX_FILE_COUNT = 1024;
   static constexpr int64_t READ_BUF_SIZE = 64 * 1024;
+  // A columnar file is read one page at a time, so this is what a scan may hold
+  // for one column of one page. A bigger page is refused rather than buffered.
+  static constexpr int64_t MAX_PAGE_LENGTH = 64 * 1024 * 1024;
 };
 
 // Where a decoding failure happened inside a file. Line and column are 1 based,
@@ -82,17 +85,21 @@ struct ObCsvScanOptions
 // One column the scanner has been told to produce, resolved before the first read.
 struct ObFileScanColumnDef
 {
-  ObFileScanColumnDef() : is_nullable_(true) {}
+  ObFileScanColumnDef() : is_nullable_(true), projected_(true) {}
   void reset()
   {
     column_name_.reset();
     meta_.set_null();
     is_nullable_ = true;
+    projected_ = true;
   }
-  TO_STRING_KV(K_(column_name), K_(meta), K_(is_nullable));
+  TO_STRING_KV(K_(column_name), K_(meta), K_(is_nullable), K_(projected));
   common::ObString column_name_;
   common::ObObjMeta meta_;
   bool is_nullable_;
+  // False when no expression of the operator reads the column, which is how a
+  // columnar reader learns to leave a whole chunk of the file alone.
+  bool projected_;
 };
 
 // The types a file column may take, listed in the order a value is recognised:
@@ -192,6 +199,14 @@ public:
                                      const common::ObString &real_path,
                                      const common::ObIArray<common::ObString> &names,
                                      common::ObIArray<ObFileColumnSchema> &schema);
+  // Read the schema a Parquet file declares in its footer: the leaf columns by
+  // name and the types the format itself states. Nothing is sampled, because
+  // the file says what it holds; a column this reader cannot represent stops
+  // the resolve rather than becoming a guess.
+  static int read_parquet_schema(common::ObIAllocator &alloc,
+                                 const common::ObString &real_path,
+                                 common::ObIArray<common::ObString> &names,
+                                 common::ObIArray<ObFileColumnSchema> &schema);
   // True if the path contains a glob meta character.
   static bool has_wildcard(const common::ObString &pattern);
   // Like resolve_and_check_path, but the target has to be a directory. Used to
@@ -241,8 +256,16 @@ public:
   // Absolute position of the first buffered byte.
   int64_t logical_pos() const { return read_off_ - (data_len_ - pos_); }
   int64_t file_size() const { return size_; }
+  // The allocator the file handle was opened with, which is the one a reader of
+  // this file has to use for anything it keeps until the scan is closed.
+  common::ObIAllocator &allocator() { return *alloc_; }
   // Rewind to the beginning and fail if the file changed since open.
   int seek_begin();
+  // Reposition to an absolute offset. A columnar format keeps its metadata at
+  // the end of the file and its pages wherever the footer says, so a reader of
+  // one needs to land in the middle rather than walk there. The window is
+  // dropped, not refilled: the next fill() reads from the new offset.
+  int seek(const int64_t offset);
   TO_STRING_KV(K_(fd), K_(file_path), K_(size), K_(read_off), K_(data_len), K_(pos), K_(eof));
 private:
   int check_fingerprint() const;
@@ -508,6 +531,427 @@ private:
   common::ObSEArray<int64_t, 16> name_order_;
   ObJsonlReader reader_;
   DISALLOW_COPY_AND_ASSIGN(ObJsonlScanner);
+};
+
+// The numbers below are the ones the Parquet format writes into its metadata.
+// They are listed as the format names them, so a reader of this file can check
+// a value against the specification without translating through a local order.
+enum ObParquetPhysicalType
+{
+  PARQUET_TYPE_BOOLEAN = 0,
+  PARQUET_TYPE_INT32 = 1,
+  PARQUET_TYPE_INT64 = 2,
+  PARQUET_TYPE_INT96 = 3,
+  PARQUET_TYPE_FLOAT = 4,
+  PARQUET_TYPE_DOUBLE = 5,
+  PARQUET_TYPE_BYTE_ARRAY = 6,
+  PARQUET_TYPE_FIXED_LEN_BYTE_ARRAY = 7
+};
+
+enum ObParquetRepetition
+{
+  PARQUET_REP_REQUIRED = 0,
+  PARQUET_REP_OPTIONAL = 1,
+  PARQUET_REP_REPEATED = 2
+};
+
+enum ObParquetEncoding
+{
+  PARQUET_ENC_PLAIN = 0,
+  PARQUET_ENC_PLAIN_DICTIONARY = 2,
+  PARQUET_ENC_RLE = 3,
+  PARQUET_ENC_BIT_PACKED = 4,
+  PARQUET_ENC_RLE_DICTIONARY = 8
+};
+
+// The converted (logical) type a column may be annotated with, numbered as the
+// format numbers them. Only these are representable by one of the file value
+// types; a decimal, a date or a timestamp annotation stops the resolve instead
+// of becoming a guess, because the number under the annotation is not the value
+// SQL would have to show. PARQUET_CONV_NONE stands for the field being absent,
+// which is how most writers leave a plain integer or string column.
+enum ObParquetConvertedType
+{
+  PARQUET_CONV_NONE = -1,
+  PARQUET_CONV_UTF8 = 0,
+  PARQUET_CONV_MAP = 1,
+  PARQUET_CONV_LIST = 3,
+  PARQUET_CONV_ENUM = 4,
+  PARQUET_CONV_DECIMAL = 5,
+  PARQUET_CONV_DATE = 6,
+  PARQUET_CONV_TIME_MILLIS = 7,
+  PARQUET_CONV_TIME_MICROS = 8,
+  PARQUET_CONV_TIMESTAMP_MILLIS = 9,
+  PARQUET_CONV_TIMESTAMP_MICROS = 10,
+  PARQUET_CONV_UINT_8 = 11,
+  PARQUET_CONV_UINT_16 = 12,
+  PARQUET_CONV_UINT_32 = 13,
+  PARQUET_CONV_UINT_64 = 14,
+  PARQUET_CONV_INT_8 = 15,
+  PARQUET_CONV_INT_16 = 16,
+  PARQUET_CONV_INT_32 = 17,
+  PARQUET_CONV_INT_64 = 18,
+  PARQUET_CONV_JSON = 19,
+  PARQUET_CONV_BSON = 20
+};
+
+enum ObParquetCodec
+{
+  PARQUET_CODEC_UNCOMPRESSED = 0,
+  PARQUET_CODEC_SNAPPY = 1
+};
+
+enum ObParquetPageType
+{
+  PARQUET_PAGE_DATA = 0,
+  PARQUET_PAGE_INDEX = 1,
+  PARQUET_PAGE_DICTIONARY = 2,
+  PARQUET_PAGE_DATA_V2 = 3
+};
+
+// Reader for the thrift compact protocol the Parquet metadata is written in. It
+// decodes the fields a scan needs and skips every field it does not, so a file
+// from a newer library still reads as long as the fields that matter stay inside
+// this subset. A field id is the id before it in the same struct plus the delta
+// in its header, so each struct keeps its own previous id and nesting needs no
+// further state.
+class ObThriftCompactReader
+{
+public:
+  ObThriftCompactReader() : buf_(NULL), len_(0), pos_(0) {}
+  void init(const char *buf, const int64_t len, const int64_t pos)
+  {
+    buf_ = buf;
+    len_ = len;
+    pos_ = pos;
+  }
+  int64_t pos() const { return pos_; }
+  // OB_ITER_END once the stop byte of the current struct is reached.
+  int next_field(int64_t &prev_id, int64_t &field_id, int8_t &type);
+  int read_i32(int32_t &value);
+  int read_i64(int64_t &value);
+  // The standalone boolean, one byte. A boolean field of a struct carries its
+  // value in the type next_field() reports and must not be read here.
+  int read_bool(bool &value);
+  int read_double(double &value);
+  // The bytes of a binary field, which stay inside the buffer being read.
+  int read_binary(common::ObString &value);
+  int read_list_header(int8_t &elem_type, int64_t &count);
+  // Consume one value of the type the field header said, however deep it is.
+  // OB_SIZE_OVERFLOW means the buffer ran out, which a caller may answer by
+  // reading a longer buffer.
+  int skip(int8_t type);
+  TO_STRING_KV(K_(pos), K_(len));
+private:
+  int read_u8(uint8_t &value);
+  int read_varint(uint64_t &value);
+  // The recursion behind skip(), carrying how deep the value nests so a
+  // malformed metadata block cannot drive the stack down indefinitely.
+  int skip_value(const int8_t type, const int64_t depth);
+  int skip_struct(const int64_t depth);
+  const char *buf_;
+  int64_t len_;
+  int64_t pos_;
+  DISALLOW_COPY_AND_ASSIGN(ObThriftCompactReader);
+};
+
+// One leaf column of a Parquet file as its footer describes it. Only a flat
+// schema is representable here: a column nested inside a group carries the
+// repetition levels of a tree, which this reader refuses instead of guessing at.
+struct ObParquetColumnSchema
+{
+  ObParquetColumnSchema()
+    : name_(), physical_type_(PARQUET_TYPE_INT32),
+      converted_type_(PARQUET_CONV_NONE), repetition_(PARQUET_REP_REQUIRED),
+      type_length_(0), num_children_(0)
+  {}
+  void reset()
+  {
+    name_.reset();
+    physical_type_ = PARQUET_TYPE_INT32;
+    converted_type_ = PARQUET_CONV_NONE;
+    repetition_ = PARQUET_REP_REQUIRED;
+    type_length_ = 0;
+    num_children_ = 0;
+  }
+  TO_STRING_KV(K_(name), K_(physical_type), K_(converted_type),
+               K_(repetition), K_(type_length), K_(num_children));
+  common::ObString name_;
+  int64_t physical_type_;
+  // The logical type the writer annotated the column with, kept so an encoding
+  // this reader cannot represent is named rather than silently reshaped.
+  int64_t converted_type_;
+  int64_t repetition_;
+  int64_t type_length_;
+  int64_t num_children_;
+};
+
+// Where one column's pages start inside one row group.
+struct ObParquetChunkLocation
+{
+  ObParquetChunkLocation()
+    : column_index_(-1), data_page_offset_(0), dictionary_page_offset_(-1),
+      total_compressed_size_(0), num_values_(0), codec_(PARQUET_CODEC_UNCOMPRESSED), path_name_()
+  {}
+  void reset()
+  {
+    column_index_ = -1;
+    data_page_offset_ = 0;
+    dictionary_page_offset_ = -1;
+    total_compressed_size_ = 0;
+    num_values_ = 0;
+    codec_ = PARQUET_CODEC_UNCOMPRESSED;
+    path_name_.reset();
+  }
+  TO_STRING_KV(K_(column_index), K_(data_page_offset), K_(dictionary_page_offset),
+               K_(total_compressed_size), K_(num_values), K_(codec), K_(path_name));
+  int64_t column_index_;
+  int64_t data_page_offset_;
+  // -1 unless the column is dictionary encoded, whose values live in a page of
+  // their own ahead of the data pages.
+  int64_t dictionary_page_offset_;
+  // Every page of the chunk, header included, so the first page plus this is
+  // where the column stops: what lies behind it belongs to the file and is not
+  // a page, however much a writer leaves something there.
+  int64_t total_compressed_size_;
+  int64_t num_values_;
+  int64_t codec_;
+  // The one name the path of the chunk in the schema holds, which is checked
+  // against the name of the column it is matched to: row groups whose chunks
+  // are out of step with the schema would otherwise hand the pages of one
+  // column to another.
+  common::ObString path_name_;
+};
+
+struct ObParquetRowGroup
+{
+  ObParquetRowGroup() : num_rows_(0), chunks_() {}
+  void reset()
+  {
+    num_rows_ = 0;
+    chunks_.reuse();
+  }
+  TO_STRING_KV(K_(num_rows), K_(chunks));
+  int64_t num_rows_;
+  common::ObSEArray<ObParquetChunkLocation, 8> chunks_;
+};
+
+// What a scan needs from the footer: the row count, the leaf columns and the
+// page addresses of every row group.
+struct ObParquetFooter
+{
+  ObParquetFooter() : num_rows_(0), data_end_(0), columns_(), row_groups_() {}
+  void reset()
+  {
+    num_rows_ = 0;
+    data_end_ = 0;
+    columns_.reuse();
+    row_groups_.reuse();
+  }
+  TO_STRING_KV(K_(num_rows), K_(data_end), K_(columns), K_(row_groups));
+  int64_t num_rows_;
+  // one past the last byte a page can occupy, which is where the metadata block
+  // of the file begins
+  int64_t data_end_;
+  common::ObSEArray<ObParquetColumnSchema, 16> columns_;
+  common::ObSEArray<ObParquetRowGroup, 4> row_groups_;
+};
+
+// One value of a decoded page. The text lives in the buffer of the column that
+// produced it and stays valid until that column reads its next page.
+struct ObParquetCell
+{
+  ObParquetCell() : off_(0), len_(0), is_null_(false) {}
+  void reset() { off_ = 0; len_ = 0; is_null_ = false; }
+  TO_STRING_KV(K_(off), K_(len), K_(is_null));
+  int64_t off_;
+  int64_t len_;
+  bool is_null_;
+};
+
+// What a scan needs from one page header. The two page versions state their
+// counts differently: a v1 page counts every row, nulls included, and carries
+// the levels inside the compressed block, while a v2 page counts the values it
+// actually stores, names the rows separately and keeps the levels in front of
+// the block, uncompressed. The fields that do not apply keep their default.
+struct ObParquetPageHeader
+{
+  ObParquetPageHeader()
+    : page_type_(PARQUET_PAGE_DATA), encoding_(PARQUET_ENC_PLAIN),
+      uncompressed_size_(0), compressed_size_(0), num_values_(0), num_rows_(0),
+      num_nulls_(0), def_level_bytes_(0), rep_level_bytes_(0),
+      def_level_encoding_(PARQUET_ENC_RLE), rep_level_encoding_(PARQUET_ENC_RLE),
+      is_compressed_(true), header_length_(0)
+  {}
+  void reset()
+  {
+    page_type_ = PARQUET_PAGE_DATA;
+    encoding_ = PARQUET_ENC_PLAIN;
+    uncompressed_size_ = 0;
+    compressed_size_ = 0;
+    num_values_ = 0;
+    num_rows_ = 0;
+    num_nulls_ = 0;
+    def_level_bytes_ = 0;
+    rep_level_bytes_ = 0;
+    def_level_encoding_ = PARQUET_ENC_RLE;
+    rep_level_encoding_ = PARQUET_ENC_RLE;
+    is_compressed_ = true;
+    header_length_ = 0;
+  }
+  TO_STRING_KV(K_(page_type), K_(encoding), K_(uncompressed_size),
+               K_(compressed_size), K_(num_values), K_(num_rows), K_(num_nulls),
+               K_(def_level_bytes), K_(rep_level_bytes), K_(def_level_encoding),
+               K_(rep_level_encoding), K_(is_compressed), K_(header_length));
+  int64_t page_type_;
+  int64_t encoding_;
+  int64_t uncompressed_size_;
+  int64_t compressed_size_;
+  int64_t num_values_;
+  int64_t num_rows_;
+  int64_t num_nulls_;
+  // only a v2 data page states these; a v1 page prefixes each block with its
+  // bit width inside the decompressed bytes instead
+  int64_t def_level_bytes_;
+  int64_t rep_level_bytes_;
+  // how a version 1 page encoded its levels, which decides whether a block
+  // starts with a bit width byte; a version 2 page always uses RLE
+  int64_t def_level_encoding_;
+  int64_t rep_level_encoding_;
+  bool is_compressed_;
+  // bytes the header itself took, so the body starts right after it
+  int64_t header_length_;
+};
+
+// Streaming reader of the Parquet format. The footer is read once and pages are
+// then read one column at a time, so what is held in memory follows the size of
+// a page rather than the size of the file. Rows leave as text exactly like the
+// CSV and JSON scanners, and are typed by the same strict parsers, so a column
+// can never be typed by one rule and converted by another.
+class ObParquetScanner : public ObFileScanner
+{
+public:
+  ObParquetScanner();
+  virtual ~ObParquetScanner();
+  virtual int open(ObFileInput &input,
+                   const common::ObIArray<ObFileScanColumnDef> &columns) override;
+  virtual int next_row(common::ObIArray<common::ObString> &row) override;
+  virtual int rescan() override;
+  virtual void close() override;
+private:
+  // The page a column is handing rows from, and where its next page is. One of
+  // these exists per requested column for as long as the scanner is open; they
+  // are allocated one by one because a page buffer cannot be copied.
+  struct ColumnState
+  {
+    ColumnState()
+      : chunk_(NULL), schema_(NULL), max_def_level_(0), text_(), cells_(),
+        dict_text_(), dict_(),
+        next_page_offset_(0), chunk_end_(0), page_first_row_(0), page_row_count_(0),
+        values_read_(0), rows_read_(0)
+    {}
+    void reset_page()
+    {
+      text_.reset();
+      cells_.reuse();
+      page_first_row_ = 0;
+      page_row_count_ = 0;
+    }
+    TO_STRING_KV(K_(next_page_offset), K_(chunk_end), K_(page_first_row), K_(page_row_count),
+                 K_(values_read), K_(rows_read), K_(max_def_level));
+    const ObParquetChunkLocation *chunk_;
+    // What the footer says about the column, kept so a page of it is decoded by
+    // the very rules its type was derived from.
+    const ObParquetColumnSchema *schema_;
+    // The deepest definition level a flat schema reaches is the column's own: 1
+    // when it may hold a null and 0 when it may not.
+    int64_t max_def_level_;
+    ObSqlString text_;
+    common::ObSEArray<ObParquetCell, 8> cells_;
+    ObSqlString dict_text_;
+    common::ObSEArray<ObParquetCell, 8> dict_;
+    int64_t next_page_offset_;
+    // one past the last byte of the pages this column has in the row group, so
+    // whatever a writer left between them and the metadata is never mistaken
+    // for another page
+    int64_t chunk_end_;
+    int64_t page_first_row_;
+    int64_t page_row_count_;
+    // how many values and rows of the column chunk have been decoded, which is
+    // what tells a scan that a column is done
+    int64_t values_read_;
+    int64_t rows_read_;
+  };
+
+  int read_at(const int64_t offset, const int64_t len, ObSqlString &out);
+  int load_footer();
+  // The current row group's chunks are matched to the requested columns, and
+  // every column starts again at its first page, so a column no expression
+  // names is never read at all.
+  int start_row_group();
+  // Decode enough pages of one column that the given row of the row group has
+  // a cell.
+  int ensure_page(ColumnState &state, const int64_t row);
+  // Read and decode the page state.next_page_offset_ points at, appending its
+  // cells and moving the offset to the page after it.
+  int load_page(ColumnState &state);
+  // Read the header at offset and then the body it describes. A header is not
+  // length prefixed, so the buffer is read tentatively and grown once more if
+  // the parse ran out of it.
+  int read_page(const int64_t offset, ObParquetPageHeader &info, ObSqlString &body);
+  int parse_page_header(const char *buf, const int64_t buf_len,
+                        ObParquetPageHeader &info);
+  // The levels of one page as one count per row. A layout this reader does not
+  // know stops the scan instead of guessing at it; consumed reports how many
+  // bytes the block took, which is how the values of a version 1 page are found.
+  int decode_levels(const char *src, const int64_t src_len, const int64_t bit_width,
+                    const int64_t count, common::ObIArray<int64_t> &levels,
+                    int64_t &consumed);
+  int decode_dictionary(ColumnState &state, const ObParquetPageHeader &info,
+                        const char *body, const int64_t body_len);
+  int decode_values(ColumnState &state, const ObParquetPageHeader &info,
+                    const char *body, const int64_t body_len);
+  // Cells for row_count rows of one page. def_levels holds a level per row when
+  // the column is optional and is not read at all when it cannot be null.
+  int format_plain(const ObParquetColumnSchema &schema, ObSqlString &text,
+                   common::ObIArray<ObParquetCell> &cells,
+                   const char *values, const int64_t values_len,
+                   const common::ObIArray<int64_t> &def_levels,
+                   const int64_t max_def_level, const int64_t row_count);
+  // A dictionary encoded page holds one index per value, and every index names
+  // an entry the dictionary page already turned into text, so the values of the
+  // column are copied rather than decoded again.
+  int format_dictionary(ColumnState &state,
+                        const char *index_bytes, const int64_t index_len,
+                        const common::ObIArray<int64_t> &def_levels,
+                        const int64_t max_def_level, const int64_t row_count);
+  // One value of the column's physical type, read at pos and appended as text.
+  // For a boolean, pos counts bits instead of bytes, because the format packs
+  // eight of them into a byte.
+  int read_value(const ObParquetColumnSchema &schema, ObSqlString &text,
+                 const char *src, const int64_t src_len, int64_t &pos,
+                 ObParquetCell &cell);
+  // Text of one decoded value, appended to the buffer the cells index.
+  int append_number(ObSqlString &text, const int64_t value, ObParquetCell &cell);
+  int append_double(ObSqlString &text, const double value, ObParquetCell &cell);
+  int append_bool(ObSqlString &text, const bool value, ObParquetCell &cell);
+  int append_text(ObSqlString &text, const char *value, const int64_t len,
+                  ObParquetCell &cell);
+
+  ObFileInput *input_;
+  common::ObIAllocator *alloc_;
+  const common::ObIArray<ObFileScanColumnDef> *columns_;
+  ObParquetFooter footer_;
+  // The metadata block read out of the end of the file. The column names the
+  // footer holds point into it, so it lives as long as the scan does; it is the
+  // descriptor of the file rather than its rows, and is bounded by MAX_PAGE_LENGTH.
+  ObSqlString meta_;
+  common::ObSEArray<ColumnState *, 16> states_;
+  int64_t row_group_index_;
+  int64_t row_in_group_;
+  int64_t group_rows_;
+  bool started_;
+  DISALLOW_COPY_AND_ASSIGN(ObParquetScanner);
 };
 
 } // end namespace sql

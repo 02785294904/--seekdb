@@ -20,6 +20,7 @@
 #include <glob.h>
 #include <limits.h>
 #include <math.h>
+#include <new>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -994,14 +995,22 @@ int ObCsvScanner::parse_one_record()
             }
             continue;
           } else if ('\n' == c) {
-            end_of_record = true;
-            ++line_;
-            line_start_off_ = byte_offset + 1;
+            // a delimiter at the end of a line asks for one more field, empty,
+            // after everything the line already holds
+            if (has_content_ && OB_FAIL(finish_field(false))) {
+            } else {
+              end_of_record = true;
+              ++line_;
+              line_start_off_ = byte_offset + 1;
+            }
           } else if ('\r' == c) {
-            end_of_record = true;
-            state_ = AFTER_CR;
-            ++line_;
-            line_start_off_ = byte_offset + 1;
+            if (has_content_ && OB_FAIL(finish_field(false))) {
+            } else {
+              end_of_record = true;
+              state_ = AFTER_CR;
+              ++line_;
+              line_start_off_ = byte_offset + 1;
+            }
           } else if (options_.quote_ == c) {
             (void)start_field();
             state_ = IN_QUOTED;
@@ -1145,7 +1154,8 @@ int ObCsvScanner::parse_one_record()
   }
   if (OB_SUCC(ret) && hit_eof) {
     // the last record of the file may have no terminator
-    if (IN_PLAIN == state_ || QUOTE_IN_QUOTED == state_ || AFTER_QUOTE == state_) {
+    if (IN_PLAIN == state_ || QUOTE_IN_QUOTED == state_ || AFTER_QUOTE == state_
+        || (FIELD_BEGIN == state_ && has_content_)) {
       if (OB_FAIL(finish_field(QUOTE_IN_QUOTED == state_ || AFTER_QUOTE == state_))) {
       } else {
         state_ = FIELD_BEGIN;
@@ -2306,6 +2316,2326 @@ int ObFileScanUtils::infer_json_column_types(common::ObIAllocator &alloc,
       schema.at(i).scale_ = 0;
     }
   }
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Parquet
+//
+// Everything below reads the format as it is written: the metadata is a thrift
+// compact struct at the end of the file, the values of a column live in pages
+// that the metadata points at, and both are decoded from their own bytes. No
+// part of a file is ever described by guessing at what a writer usually does.
+// ---------------------------------------------------------------------------
+namespace
+{
+// The type numbers the thrift compact protocol writes into a field header. They
+// belong to that encoding rather than to Parquet, and the whole metadata of a
+// Parquet file is written in it.
+const int8_t PARQUET_TC_BOOLEAN_TRUE = 1;
+const int8_t PARQUET_TC_BOOLEAN_FALSE = 2;
+const int8_t PARQUET_TC_BYTE = 3;
+const int8_t PARQUET_TC_I16 = 4;
+const int8_t PARQUET_TC_I32 = 5;
+const int8_t PARQUET_TC_I64 = 6;
+const int8_t PARQUET_TC_DOUBLE = 7;
+const int8_t PARQUET_TC_BINARY = 8;
+const int8_t PARQUET_TC_LIST = 9;
+const int8_t PARQUET_TC_SET = 10;
+const int8_t PARQUET_TC_MAP = 11;
+const int8_t PARQUET_TC_STRUCT = 12;
+
+// How deep a metadata value is allowed to nest. The structures of this format
+// nest three levels at most; past this a block is malformed and is refused
+// instead of followed further down.
+const int64_t PARQUET_MAX_NESTING = 32;
+
+// The first guess at the length of a page header. A header is tens of bytes, so
+// doubling from here reaches the real size in a couple of tries and never makes
+// a scan read the file twice for one page.
+const int64_t PARQUET_HEAD_TRY_LEN = 512;
+
+// The longest block this reader is willing to treat as a page header at all. A
+// header is a handful of counts and an encoding, so one that goes past this is
+// a file lying about its pages rather than an unusually wordy header.
+const int64_t PARQUET_HEAD_MAX_LEN = 64 * 1024;
+
+// A value is refused once it passes this many bytes; it is the same bound the
+// record of a row oriented file answers with.
+const int64_t PARQUET_MAX_VALUE_LENGTH = 8 * 1024 * 1024;
+
+// A malformed file is reported the way a malformed CSV record is: one 1210
+// whose text says what went wrong and, where it is known, at what byte.
+int parquet_bad_file(const char *what)
+{
+  const int ret = OB_INVALID_ARGUMENT;
+  char msg[192] = { 0 };
+  snprintf(msg, sizeof(msg), "invalid parquet file: %s", what);
+  LOG_USER_ERROR(OB_INVALID_ARGUMENT, msg);
+  LOG_WARN("invalid parquet file", K(ret), "what", what);
+  return ret;
+}
+
+int parquet_bad_file_at(const char *what, const int64_t offset)
+{
+  const int ret = OB_INVALID_ARGUMENT;
+  char msg[192] = { 0 };
+  snprintf(msg, sizeof(msg), "invalid parquet file: %s at byte %ld", what, offset);
+  LOG_USER_ERROR(OB_INVALID_ARGUMENT, msg);
+  LOG_WARN("invalid parquet file", K(ret), "what", what, K(offset));
+  return ret;
+}
+
+// Something the file asks for that this format reader will not invent.
+int parquet_unsupported(const char *what)
+{
+  const int ret = OB_NOT_SUPPORTED;
+  LOG_USER_ERROR(OB_NOT_SUPPORTED, what);
+  LOG_WARN("unsupported parquet feature", K(ret), "what", what);
+  return ret;
+}
+
+// The zigzag a compact protocol integer is stored with: the sign is the lowest
+// bit, so the magnitude of a negative number is inverted.
+int64_t parquet_zigzag(const uint64_t raw)
+{
+  const uint64_t mask = (0 != (raw & 1)) ? UINT64_MAX : 0;
+  return static_cast<int64_t>((raw >> 1) ^ mask);
+}
+
+// Little endian integers, assembled byte by byte so the reader does not depend
+// on the alignment or the byte order of the machine it runs on.
+uint64_t parquet_le_u64(const char *src, const int64_t len)
+{
+  uint64_t value = 0;
+  for (int64_t i = len - 1; i >= 0; --i) {
+    value = (value << 8) | static_cast<uint8_t>(src[i]);
+  }
+  return value;
+}
+
+int64_t parquet_le_i64(const char *src, const int64_t len)
+{
+  const uint64_t raw = parquet_le_u64(src, len);
+  int64_t value = 0;
+  if (8 == len) {
+    value = static_cast<int64_t>(raw);
+  } else {
+    // flip the top bit and take it back, which sign extends without shifting a
+    // value whose width the file states
+    const uint64_t sign_bit = 1ULL << (len * 8 - 1);
+    value = static_cast<int64_t>((raw ^ sign_bit) - sign_bit);
+  }
+  return value;
+}
+
+double parquet_le_double(const char *src)
+{
+  const uint64_t raw = parquet_le_u64(src, 8);
+  double value = 0;
+  MEMCPY(&value, &raw, sizeof(value));
+  return value;
+}
+
+double parquet_le_float(const char *src)
+{
+  const uint64_t raw = parquet_le_u64(src, 4);
+  float value = 0;
+  MEMCPY(&value, &raw, sizeof(value));
+  return static_cast<double>(value);
+}
+
+// A base 128 varint, which both the thrift compact protocol and the snappy
+// block format use for their counts.
+int parquet_read_varint(const char *src, const int64_t src_len, int64_t &pos, uint64_t &value)
+{
+  int ret = OB_SUCCESS;
+  uint64_t result = 0;
+  int64_t shift = 0;
+  value = 0;
+  while (OB_SUCC(ret)) {
+    if (pos >= src_len) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      const uint8_t byte = static_cast<uint8_t>(src[pos]);
+      ++pos;
+      result |= (static_cast<uint64_t>(byte & 0x7f)) << shift;
+      if (0 == (byte & 0x80)) {
+        value = result;
+        break;
+      } else if ((shift += 7) >= 64) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("varint is too long to be a number", K(ret), K(shift), K(pos));
+      }
+    }
+  }
+  return ret;
+}
+
+// How many bits one level of a page needs. A column that cannot be null has no
+// levels at all, which is what a width of zero means here.
+int64_t parquet_level_bit_width(const int64_t max_level)
+{
+  int64_t bits = 0;
+  while (max_level >= (1LL << bits)) {
+    ++bits;
+  }
+  return bits;
+}
+
+// Hand out len bytes copied from offset bytes back in the block being produced.
+// One byte at a time, because a copy is allowed to reach into the bytes the copy
+// itself is writing, which is how the format repeats a run.
+int parquet_copy_back(common::ObSqlString &out, const int64_t len, const int64_t offset,
+                      const int64_t expect_len)
+{
+  int ret = OB_SUCCESS;
+  if (offset <= 0 || offset > out.length() || len <= 0 || out.length() + len > expect_len) {
+    ret = parquet_bad_file("copy points outside the bytes already decoded");
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < len; ++i) {
+    if (OB_FAIL(out.append(out.ptr() + (out.length() - offset), 1))) {
+      LOG_WARN("failed to copy back", K(ret), K(i), K(offset));
+    }
+  }
+  return ret;
+}
+
+// The raw snappy block format, which is what the Snappy codec of this file
+// format writes: the length of the result as a varint, then a run of literals
+// and of copies of bytes the block has already produced. A block that does not
+// come out exactly as long as it promised is a broken file, not a hint.
+int parquet_snappy_decode(const char *src, const int64_t src_len, const int64_t expect_len,
+                          common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+  uint64_t declared = 0;
+  out.reset();
+  if (src_len < 0 || expect_len < 0) {
+    ret = parquet_bad_file("negative page length");
+  } else if (OB_FAIL(parquet_read_varint(src, src_len, pos, declared))) {
+    ret = (OB_BUF_NOT_ENOUGH == ret) ? parquet_bad_file("truncated compressed block header") : ret;
+  } else if (static_cast<int64_t>(declared) != expect_len) {
+    ret = parquet_bad_file("compressed block does not promise what the page header states");
+  } else if (OB_FAIL(out.reserve(expect_len))) {
+    LOG_WARN("failed to reserve uncompressed page", K(ret), K(expect_len));
+  } else {
+    while (OB_SUCC(ret) && pos < src_len && out.length() < expect_len) {
+      const uint8_t tag = static_cast<uint8_t>(src[pos]);
+      ++pos;
+      switch (tag & 3) {
+      case 0: {
+        // a literal, whose length is in the tag unless the tag says otherwise
+        int64_t len = tag >> 2;
+        if (len >= 60) {
+          const int64_t len_bytes = len - 59;
+          if (pos + len_bytes > src_len) {
+            ret = parquet_bad_file_at("literal length runs past the block", pos);
+          } else {
+            len = static_cast<int64_t>(parquet_le_u64(src + pos, len_bytes)) + 1;
+            pos += len_bytes;
+          }
+        } else {
+          ++len;
+        }
+        if (OB_FAIL(ret)) {
+        } else if (len > src_len - pos || out.length() + len > expect_len) {
+          ret = parquet_bad_file_at("literal runs past the block", pos);
+        } else if (OB_FAIL(out.append(src + pos, len))) {
+          LOG_WARN("failed to copy literal", K(ret), K(len));
+        } else {
+          pos += len;
+        }
+        break;
+      }
+      case 1: {
+        // copy of 4 to 11 bytes with an eleven bit offset
+        uint16_t word = 0;
+        if (pos + 2 > src_len) {
+          ret = parquet_bad_file_at("copy offset runs past the block", pos);
+        } else {
+          word = static_cast<uint16_t>(parquet_le_u64(src + pos, 2));
+          pos += 2;
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(parquet_copy_back(out, ((tag >> 2) & 0x07) + 4,
+                                             static_cast<int64_t>(word >> 5), expect_len))) {
+        }
+        break;
+      }
+      case 2: {
+        // copy of up to 64 bytes with a sixteen bit offset
+        if (pos + 2 > src_len) {
+          ret = parquet_bad_file_at("copy offset runs past the block", pos);
+        } else {
+          const int64_t offset = static_cast<int64_t>(parquet_le_u64(src + pos, 2));
+          pos += 2;
+          ret = parquet_copy_back(out, (tag >> 2) + 1, offset, expect_len);
+        }
+        break;
+      }
+      default: {
+        // copy of up to 64 bytes with a thirty two bit offset
+        if (pos + 4 > src_len) {
+          ret = parquet_bad_file_at("copy offset runs past the block", pos);
+        } else {
+          const int64_t offset = static_cast<int64_t>(parquet_le_u64(src + pos, 4));
+          pos += 4;
+          ret = parquet_copy_back(out, (tag >> 2) + 1, offset, expect_len);
+        }
+        break;
+      }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (out.length() != expect_len || pos != src_len) {
+      ret = parquet_bad_file("compressed block does not hold what its header promised");
+    }
+  }
+  return ret;
+}
+
+// The run length encoding the format uses for its levels and for a packed
+// boolean column. Runs alternate between one value repeated and groups of eight
+// values packed into the low bits of each byte, and a run's header says which by
+// its lowest bit.
+int parquet_hybrid_decode(const char *src, const int64_t src_len, const int64_t bit_width,
+                          const int64_t count, common::ObIArray<int64_t> &values,
+                          int64_t &consumed)
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+  int64_t got = 0;
+  consumed = 0;
+  values.reuse();
+  if (count < 0 || bit_width < 0 || bit_width > 32 || src_len < 0) {
+    ret = parquet_bad_file("a level block asks for an impossible bit width");
+  } else if (0 == bit_width) {
+    // nothing is stored: every level of the run is zero, which is the layout of
+    // a column that cannot be null
+    while (OB_SUCC(ret) && got < count) {
+      if (OB_FAIL(values.push_back(0))) {
+        LOG_WARN("failed to store level", K(ret), K(got));
+      } else {
+        ++got;
+      }
+    }
+  } else {
+    while (OB_SUCC(ret) && got < count) {
+      uint64_t header = 0;
+      if (OB_FAIL(parquet_read_varint(src, src_len, pos, header))) {
+        ret = (OB_BUF_NOT_ENOUGH == ret)
+              ? parquet_bad_file("truncated level block") : ret;
+      } else if (0 != (header & 1)) {
+        // bit packed run: the header counts groups of eight values
+        const int64_t run = static_cast<int64_t>(header >> 1) * 8;
+        const int64_t bytes = (run * bit_width + 7) / 8;
+        if (run <= 0 || pos + bytes > src_len) {
+          ret = parquet_bad_file("bit packed level run runs past its block");
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < run && got < count; ++i) {
+          int64_t value = 0;
+          int64_t bit = pos * 8 + i * bit_width;
+          for (int64_t b = 0; OB_SUCC(ret) && b < bit_width; ++b, ++bit) {
+            if (bit / 8 >= src_len) {
+              ret = parquet_bad_file("level value runs past its block");
+            } else {
+              const uint8_t byte = static_cast<uint8_t>(src[bit / 8]);
+              value |= (static_cast<int64_t>((byte >> (bit % 8)) & 1)) << b;
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(values.push_back(value))) {
+            LOG_WARN("failed to store level", K(ret), K(i));
+          } else {
+            ++got;
+          }
+        }
+        if (OB_SUCC(ret)) {
+          pos += bytes;
+        }
+      } else {
+        // repeated run: one value, held in as many bytes as the width needs
+        const int64_t run = static_cast<int64_t>(header >> 1);
+        const int64_t bytes = (bit_width + 7) / 8;
+        if (run <= 0 || pos + bytes > src_len) {
+          ret = parquet_bad_file("repeated level run runs past its block");
+        } else {
+          const int64_t value = parquet_le_i64(src + pos, bytes);
+          pos += bytes;
+          for (int64_t i = 0; OB_SUCC(ret) && i < run && got < count; ++i) {
+            if (OB_FAIL(values.push_back(value))) {
+              LOG_WARN("failed to store level", K(ret), K(i));
+            } else {
+              ++got;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    consumed = pos;
+  }
+  return ret;
+}
+
+// One element of the schema list of the footer. The list is a depth first
+// traversal of a tree flattened into it, so which element is a column and which
+// is a group is told by the child count and nothing here needs the tree.
+int pq_parse_schema_element(ObThriftCompactReader &reader,
+                            ObParquetColumnSchema &column,
+                            bool &is_group)
+{
+  int ret = OB_SUCCESS;
+  column.reset();
+  is_group = false;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    int32_t value = 0;
+    if (1 == field_id) {
+      // type: the physical type the values of a column are stored as
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        column.physical_type_ = value;
+      }
+    } else if (2 == field_id) {
+      // type_length
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        column.type_length_ = value;
+      }
+    } else if (3 == field_id) {
+      // repetition_type, which the root of the schema does not carry
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        column.repetition_ = value;
+      }
+    } else if (4 == field_id) {
+      // name
+      if (OB_FAIL(reader.read_binary(column.name_))) {
+      }
+    } else if (5 == field_id) {
+      // num_children, whose presence is what makes the element a group
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else if (value < 0) {
+        ret = parquet_bad_file("schema element declares a negative number of children");
+      } else {
+        column.num_children_ = value;
+        is_group = true;
+      }
+    } else if (6 == field_id) {
+      // converted_type: the logical type the writer annotated the element with
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        column.converted_type_ = value;
+      }
+    } else {
+      // scale, precision, field id and the logical type block all land here
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    // the stop byte of the struct
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH == ret) {
+    ret = parquet_bad_file("schema element runs past the metadata block");
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read parquet schema element", K(ret), K(field_id), K(type));
+  }
+  if (OB_SUCC(ret) && !is_group && column.name_.empty()) {
+    ret = parquet_bad_file("schema element holds no name");
+  }
+  return ret;
+}
+
+// Where the pages of one column of one row group are, and what is in them.
+int pq_parse_column_meta(ObThriftCompactReader &reader, ObParquetChunkLocation &chunk)
+{
+  int ret = OB_SUCCESS;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  bool has_path = false;
+  while (OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    if (2 == field_id) {
+      // encodings: which ways of storing levels and values the chunk uses,
+      // restated by every page header where it matters
+      int8_t elem_type = 0;
+      int64_t count = 0;
+      if (OB_FAIL(reader.read_list_header(elem_type, count))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        ret = reader.skip(elem_type);
+      }
+    } else if (3 == field_id) {
+      // path_in_schema: the names of the tree the chunk belongs to. A relation
+      // built on a flat schema is only ever handed one name, which is the column
+      int8_t elem_type = 0;
+      int64_t count = 0;
+      if (OB_FAIL(reader.read_list_header(elem_type, count))) {
+      } else if (PARQUET_TC_BINARY != elem_type) {
+        ret = parquet_bad_file("column path is not a list of names");
+      } else if (1 != count) {
+        ret = parquet_unsupported("parquet column nested inside a group");
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        if (OB_FAIL(reader.read_binary(chunk.path_name_))) {
+        } else {
+          has_path = true;
+        }
+      }
+    } else if (4 == field_id) {
+      // codec
+      int32_t value = 0;
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        chunk.codec_ = value;
+      }
+    } else if (5 == field_id) {
+      // num_values
+      if (OB_FAIL(reader.read_i64(chunk.num_values_))) {
+      }
+    } else if (7 == field_id) {
+      // total_compressed_size: the bytes of every page the chunk holds, header
+      // included, which is the only thing that says where its pages stop
+      if (OB_FAIL(reader.read_i64(chunk.total_compressed_size_))) {
+      }
+    } else if (9 == field_id) {
+      // data_page_offset
+      if (OB_FAIL(reader.read_i64(chunk.data_page_offset_))) {
+      }
+    } else if (11 == field_id) {
+      // dictionary_page_offset
+      if (OB_FAIL(reader.read_i64(chunk.dictionary_page_offset_))) {
+      }
+    } else {
+      // type, the uncompressed size, statistics, the page orders and the bloom filter
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH == ret) {
+    ret = parquet_bad_file("column metadata runs past the metadata block");
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read parquet column metadata", K(ret), K(field_id), K(type));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!has_path) {
+    ret = parquet_bad_file("column metadata holds no path");
+  } else if (chunk.num_values_ < 0 || chunk.data_page_offset_ < 0) {
+    ret = parquet_bad_file("column metadata states a negative count or offset");
+  }
+  return ret;
+}
+
+int pq_parse_column_chunk(ObThriftCompactReader &reader, ObParquetChunkLocation &chunk)
+{
+  int ret = OB_SUCCESS;
+  chunk.reset();
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  bool has_meta = false;
+  while (OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    if (1 == field_id) {
+      // file_path: a chunk kept in another file is a column this reader cannot
+      // open, because a file table names one file at a time
+      common::ObString path;
+      if (OB_FAIL(reader.read_binary(path))) {
+      } else if (!path.empty()) {
+        ret = parquet_unsupported("parquet column stored in a separate file");
+      }
+    } else if (3 == field_id && PARQUET_TC_STRUCT == type) {
+      has_meta = true;
+      if (OB_FAIL(pq_parse_column_meta(reader, chunk))) {
+      }
+    } else {
+      // file_offset, which the page offsets themselves make redundant, and the
+      // index and cryptographic metadata of the chunk
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH == ret) {
+    ret = parquet_bad_file("column chunk runs past the metadata block");
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read parquet column chunk", K(ret), K(field_id), K(type));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!has_meta) {
+    ret = parquet_bad_file("column chunk holds no metadata");
+  }
+  return ret;
+}
+
+int pq_parse_row_group(ObThriftCompactReader &reader, ObParquetRowGroup &group)
+{
+  int ret = OB_SUCCESS;
+  group.reset();
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    if (1 == field_id) {
+      // columns: one chunk per column of the schema, in the order of the schema
+      int8_t elem_type = 0;
+      int64_t count = 0;
+      if (OB_FAIL(reader.read_list_header(elem_type, count))) {
+      } else if (PARQUET_TC_STRUCT != elem_type) {
+        ret = parquet_bad_file("row group columns are not a list of chunks");
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        ObParquetChunkLocation chunk;
+        chunk.column_index_ = i;
+        if (OB_FAIL(pq_parse_column_chunk(reader, chunk))) {
+        } else if (OB_FAIL(group.chunks_.push_back(chunk))) {
+          LOG_WARN("failed to collect parquet chunk", K(ret), K(i));
+        }
+      }
+    } else if (3 == field_id) {
+      // num_rows
+      if (OB_FAIL(reader.read_i64(group.num_rows_))) {
+      }
+    } else {
+      // total_byte_size, the sorting columns, the file offset and the ordinal
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH == ret) {
+    ret = parquet_bad_file("row group runs past the metadata block");
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read parquet row group", K(ret), K(field_id), K(type));
+  }
+  if (OB_SUCC(ret) && group.num_rows_ < 0) {
+    ret = parquet_bad_file("row group states a negative number of rows");
+  }
+  return ret;
+}
+
+// The metadata block as a whole: the columns, how many rows the file holds and
+// where the pages of every row group start.
+int pq_parse_file_meta(ObThriftCompactReader &reader, ObParquetFooter &footer)
+{
+  int ret = OB_SUCCESS;
+  footer.reset();
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  bool has_schema = false;
+  bool has_rows = false;
+  while (OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    if (2 == field_id) {
+      has_schema = true;
+      // schema: the flattened tree, whose leaves are the columns
+      int8_t elem_type = 0;
+      int64_t count = 0;
+      ObParquetColumnSchema root;
+      bool root_is_group = false;
+      if (OB_FAIL(reader.read_list_header(elem_type, count))) {
+      } else if (PARQUET_TC_STRUCT != elem_type) {
+        ret = parquet_bad_file("schema is not a list of elements");
+      } else if (count < 1) {
+        ret = parquet_bad_file("schema holds no root element");
+      } else if (OB_FAIL(pq_parse_schema_element(reader, root, root_is_group))) {
+      } else if (!root_is_group) {
+        ret = parquet_bad_file("the root of the schema is a column");
+      }
+      // everything past the root is one of its children: a child of a child
+      // would put the values of a column under a tree this relation has no
+      // place for
+      for (int64_t i = 1; OB_SUCC(ret) && i < count; ++i) {
+        ObParquetColumnSchema column;
+        bool is_group = false;
+        if (i - 1 >= root.num_children_) {
+          ret = parquet_unsupported("parquet schema nested deeper than one level");
+        } else if (OB_FAIL(pq_parse_schema_element(reader, column, is_group))) {
+        } else if (is_group) {
+          ret = parquet_unsupported("parquet column nested inside a group");
+        } else if (OB_FAIL(footer.columns_.push_back(column))) {
+          LOG_WARN("failed to collect parquet column", K(ret), K(i));
+        }
+      }
+      if (OB_SUCC(ret) && root.num_children_ != footer.columns_.count()) {
+        ret = parquet_bad_file("schema holds fewer elements than its root declares");
+      }
+    } else if (3 == field_id) {
+      has_rows = true;
+      // num_rows
+      if (OB_FAIL(reader.read_i64(footer.num_rows_))) {
+      }
+    } else if (4 == field_id) {
+      // row_groups
+      int8_t elem_type = 0;
+      int64_t count = 0;
+      if (OB_FAIL(reader.read_list_header(elem_type, count))) {
+      } else if (PARQUET_TC_STRUCT != elem_type) {
+        ret = parquet_bad_file("row groups are not a list of groups");
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        ObParquetRowGroup group;
+        if (OB_FAIL(pq_parse_row_group(reader, group))) {
+        } else if (group.chunks_.count() != footer.columns_.count()) {
+          ret = parquet_bad_file("row group does not hold one chunk per column");
+        } else if (OB_FAIL(footer.row_groups_.push_back(group))) {
+          LOG_WARN("failed to collect parquet row group", K(ret), K(i));
+        }
+      }
+    } else {
+      // version, key value metadata, created_by and the column orders
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH == ret) {
+    ret = parquet_bad_file("metadata block runs past the end of the file");
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read parquet metadata", K(ret), K(field_id), K(type));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!has_schema || !has_rows) {
+    ret = parquet_bad_file("metadata block holds no schema or no row count");
+  } else if (footer.num_rows_ < 0) {
+    ret = parquet_bad_file("metadata block states a negative number of rows");
+  } else if (footer.columns_.count() > ObFileScanLimits::MAX_COLUMN_COUNT) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("parquet file has too many columns", K(ret), "count",
+             footer.columns_.count(), "limit", ObFileScanLimits::MAX_COLUMN_COUNT);
+  }
+  return ret;
+}
+
+// Copy len bytes from offset into out. The window of the handle is refilled as
+// it runs out, so a block larger than the window reads the way a small one does
+// and a whole file is never held.
+int pq_read_range(ObFileInput &input, const int64_t offset, const int64_t len,
+                  common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  out.reset();
+  if (offset < 0 || len < 0) {
+    ret = parquet_bad_file("negative read range");
+  } else if (len > ObFileScanLimits::MAX_PAGE_LENGTH) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("parquet block is too large to read", K(ret), K(len), K(offset),
+             "limit", ObFileScanLimits::MAX_PAGE_LENGTH);
+  } else if (offset > input.file_size() || len > input.file_size() - offset) {
+    ret = parquet_bad_file_at("block lies past the end of the file", offset);
+  } else if (OB_FAIL(out.reserve(len))) {
+    LOG_WARN("failed to reserve parquet block", K(ret), K(len));
+  } else if (OB_FAIL(input.seek(offset))) {
+    LOG_WARN("failed to position parquet file", K(ret), K(offset));
+  } else {
+    int64_t need = len;
+    while (OB_SUCC(ret) && need > 0) {
+      const common::ObString buffered = input.buffered();
+      if (buffered.length() <= 0) {
+        if (input.is_eof()) {
+          ret = parquet_bad_file_at("file ends before the block it promised",
+                                    input.logical_pos());
+        } else if (OB_FAIL(input.fill())) {
+          if (OB_ITER_END == ret) {
+            ret = parquet_bad_file_at("file ends before the block it promised",
+                                      input.logical_pos());
+          } else {
+            LOG_WARN("failed to read parquet block", K(ret));
+          }
+        }
+      } else {
+        const int64_t take = (need < buffered.length()) ? need : buffered.length();
+        if (OB_FAIL(out.append(buffered.ptr(), take))) {
+          LOG_WARN("failed to collect parquet block", K(ret), K(take));
+        } else {
+          input.consume(take);
+          need -= take;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Read and parse the metadata block of an opened file. The names the footer
+// hands out point into meta, which the caller therefore has to keep alive.
+int pq_load_footer(ObFileInput &input, common::ObSqlString &meta, ObParquetFooter &footer)
+{
+  int ret = OB_SUCCESS;
+  footer.reset();
+  const int64_t file_size = input.file_size();
+  common::ObSqlString head;
+  common::ObSqlString tail;
+  if (file_size < 12) {
+    ret = parquet_bad_file("file is too short to hold a parquet footer");
+  } else if (OB_FAIL(pq_read_range(input, 0, 4, head))) {
+    LOG_WARN("failed to read parquet head", K(ret));
+  } else if (0 != MEMCMP(head.ptr(), "PAR1", 4)) {
+    ret = parquet_bad_file("file does not start with the parquet magic");
+  } else if (OB_FAIL(pq_read_range(input, file_size - 8, 8, tail))) {
+    LOG_WARN("failed to read parquet tail", K(ret));
+  } else if (0 != MEMCMP(tail.ptr() + 4, "PAR1", 4)) {
+    ret = parquet_bad_file("file does not end with the parquet magic");
+  } else {
+    // the four bytes before the closing magic are the length of the block
+    const int64_t meta_len = parquet_le_i64(tail.ptr(), 4);
+    if (meta_len <= 0) {
+      ret = parquet_bad_file("parquet metadata block has no length");
+    } else if (meta_len > ObFileScanLimits::MAX_PAGE_LENGTH) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("parquet metadata block is too large", K(ret), K(meta_len));
+    } else if (meta_len > file_size - 12) {
+      ret = parquet_bad_file("parquet metadata block is longer than the file");
+    } else if (OB_FAIL(pq_read_range(input, file_size - 8 - meta_len, meta_len, meta))) {
+      LOG_WARN("failed to read parquet metadata block", K(ret), K(meta_len));
+    } else {
+      ObThriftCompactReader reader;
+      reader.init(meta.ptr(), meta.length(), 0);
+      if (OB_FAIL(pq_parse_file_meta(reader, footer))) {
+      } else if (OB_UNLIKELY(reader.pos() != meta.length())) {
+        ret = parquet_bad_file("metadata block holds bytes this reader could not use");
+      } else {
+        // where the pages of the file end: parsing the block starts by emptying
+        // the footer, so the bound has to be stated after it is filled
+        footer.data_end_ = file_size - 8 - meta_len;
+      }
+    }
+  }
+  return ret;
+}
+
+} // end anonymous namespace
+
+int ObFileInput::seek(const int64_t offset)
+{
+  int ret = OB_SUCCESS;
+  if (!is_opened()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("file input is not opened", K(ret));
+  } else if (offset < 0 || offset > size_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("offset lies outside the file", K(ret), K(offset), K(size_));
+  } else if (static_cast<int64_t>(::lseek(fd_, offset, SEEK_SET)) != offset) {
+    ret = OB_IO_ERROR;
+    LOG_WARN("failed to position file", K(ret), K(file_path_), K(offset), "errno", errno);
+  } else {
+    // the window is dropped rather than refilled: what the reader of a columnar
+    // file asks for is never the byte the window happens to start at, and a BOM
+    // only means something at the head of a file, which this is not
+    data_len_ = 0;
+    pos_ = 0;
+    read_off_ = offset;
+    eof_ = (offset >= size_);
+    bom_skipped_ = true;
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_u8(uint8_t &value)
+{
+  int ret = OB_SUCCESS;
+  if (pos_ >= len_) {
+    ret = OB_BUF_NOT_ENOUGH;
+  } else {
+    value = static_cast<uint8_t>(buf_[pos_]);
+    ++pos_;
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_varint(uint64_t &value)
+{
+  int ret = OB_SUCCESS;
+  value = 0;
+  int64_t shift = 0;
+  while (OB_SUCC(ret)) {
+    uint8_t byte = 0;
+    if (OB_FAIL(read_u8(byte))) {
+    } else {
+      value |= (static_cast<uint64_t>(byte & 0x7f)) << shift;
+      if (0 == (byte & 0x80)) {
+        break;
+      } else if ((shift += 7) >= 64) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("varint is too long to be a number", K(ret), K(shift), K_(pos));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::next_field(int64_t &prev_id, int64_t &field_id, int8_t &type)
+{
+  int ret = OB_SUCCESS;
+  uint8_t head = 0;
+  if (OB_FAIL(read_u8(head))) {
+  } else if (0 == head) {
+    // the stop byte, which is how a struct says it is over
+    ret = OB_ITER_END;
+  } else {
+    type = static_cast<int8_t>(head & 0x0f);
+    const int64_t delta = (head >> 4) & 0x0f;
+    if (delta > 0) {
+      field_id = prev_id + delta;
+    } else {
+      int32_t id = 0;
+      if (OB_FAIL(read_i32(id))) {
+        LOG_WARN("failed to read field id", K(ret));
+      } else {
+        field_id = id;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      prev_id = field_id;
+    }
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_i32(int32_t &value)
+{
+  int ret = OB_SUCCESS;
+  int64_t wide = 0;
+  value = 0;
+  if (OB_FAIL(read_i64(wide))) {
+    if (OB_BUF_NOT_ENOUGH != ret) {
+      LOG_WARN("failed to read i32", K(ret));
+    }
+  } else if (wide < INT32_MIN || wide > INT32_MAX) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("i32 field does not fit its width", K(ret), K(wide));
+  } else {
+    value = static_cast<int32_t>(wide);
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_i64(int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  uint64_t raw = 0;
+  value = 0;
+  if (OB_FAIL(read_varint(raw))) {
+    if (OB_BUF_NOT_ENOUGH != ret) {
+      LOG_WARN("failed to read i64", K(ret));
+    }
+  } else {
+    value = parquet_zigzag(raw);
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_bool(bool &value)
+{
+  int ret = OB_SUCCESS;
+  uint8_t byte = 0;
+  value = false;
+  if (OB_FAIL(read_u8(byte))) {
+  } else if (byte > 1) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("boolean field is not a flag", K(ret), K(byte));
+  } else {
+    value = (1 == byte);
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_double(double &value)
+{
+  int ret = OB_SUCCESS;
+  value = 0;
+  if (pos_ + 8 > len_) {
+    ret = OB_BUF_NOT_ENOUGH;
+  } else {
+    value = parquet_le_double(buf_ + pos_);
+    pos_ += 8;
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_binary(common::ObString &value)
+{
+  int ret = OB_SUCCESS;
+  uint64_t len = 0;
+  value.reset();
+  if (OB_FAIL(read_varint(len))) {
+    if (OB_BUF_NOT_ENOUGH != ret) {
+      LOG_WARN("failed to read binary length", K(ret));
+    }
+  } else if (len > static_cast<uint64_t>(len_ - pos_)) {
+    ret = OB_BUF_NOT_ENOUGH;
+  } else {
+    // the bytes stay where they are: the buffer outlives the reader, so a name
+    // read here is as good as one copied
+    value.assign_ptr(buf_ + pos_, static_cast<int32_t>(len));
+    pos_ += static_cast<int64_t>(len);
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::read_list_header(int8_t &elem_type, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  uint8_t head = 0;
+  elem_type = 0;
+  count = 0;
+  if (OB_FAIL(read_u8(head))) {
+  } else {
+    count = head >> 4;
+    elem_type = static_cast<int8_t>(head & 0x0f);
+    if (15 == count) {
+      uint64_t wide = 0;
+      if (OB_FAIL(read_varint(wide))) {
+        if (OB_BUF_NOT_ENOUGH != ret) {
+          LOG_WARN("failed to read list count", K(ret));
+        }
+      } else {
+        count = static_cast<int64_t>(wide);
+      }
+    }
+    // an element takes at least one byte, except a boolean, whose value is the
+    // type of the field that holds it; a list longer than the buffer left is
+    // therefore a lie about the file
+    if (OB_SUCC(ret) && (count < 0
+        || (count > len_ - pos_
+            && PARQUET_TC_BOOLEAN_TRUE != elem_type
+            && PARQUET_TC_BOOLEAN_FALSE != elem_type))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("list is longer than the metadata block", K(ret), K(count), K_(pos), K_(len));
+    }
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::skip(const int8_t type)
+{
+  return skip_value(type, 0);
+}
+
+int ObThriftCompactReader::skip_value(const int8_t type, const int64_t depth)
+{
+  int ret = OB_SUCCESS;
+  if (depth > PARQUET_MAX_NESTING) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("metadata value nests too deep", K(ret), K(depth), K(type));
+  } else if (PARQUET_TC_BOOLEAN_TRUE == type || PARQUET_TC_BOOLEAN_FALSE == type) {
+    // the value already is the type of the field, so nothing follows it
+  } else if (PARQUET_TC_BYTE == type || PARQUET_TC_I16 == type
+             || PARQUET_TC_I32 == type || PARQUET_TC_I64 == type) {
+    uint64_t raw = 0;
+    if (OB_FAIL(read_varint(raw))) {
+      if (OB_BUF_NOT_ENOUGH != ret) {
+        LOG_WARN("failed to skip integer", K(ret), K(type));
+      }
+    }
+  } else if (PARQUET_TC_DOUBLE == type) {
+    if (pos_ + 8 > len_) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      pos_ += 8;
+    }
+  } else if (PARQUET_TC_BINARY == type) {
+    uint64_t len = 0;
+    if (OB_FAIL(read_varint(len))) {
+      if (OB_BUF_NOT_ENOUGH != ret) {
+        LOG_WARN("failed to skip binary length", K(ret));
+      }
+    } else if (len > static_cast<uint64_t>(len_ - pos_)) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      pos_ += static_cast<int64_t>(len);
+    }
+  } else if (PARQUET_TC_LIST == type || PARQUET_TC_SET == type) {
+    int8_t elem_type = 0;
+    int64_t count = 0;
+    if (OB_FAIL(read_list_header(elem_type, count))) {
+      if (OB_BUF_NOT_ENOUGH != ret && OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to skip list header", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      if (OB_FAIL(skip_value(elem_type, depth + 1))) {
+        if (OB_BUF_NOT_ENOUGH != ret && OB_INVALID_ARGUMENT != ret) {
+          LOG_WARN("failed to skip list element", K(ret), K(i));
+        }
+      }
+    }
+  } else if (PARQUET_TC_MAP == type) {
+    uint64_t size = 0;
+    if (OB_FAIL(read_varint(size))) {
+      if (OB_BUF_NOT_ENOUGH != ret) {
+        LOG_WARN("failed to skip map size", K(ret));
+      }
+    } else if (size > 0) {
+      uint8_t types = 0;
+      if (OB_FAIL(read_u8(types))) {
+      } else {
+        const int8_t key_type = static_cast<int8_t>((types >> 4) & 0x0f);
+        const int8_t value_type = static_cast<int8_t>(types & 0x0f);
+        for (int64_t i = 0; OB_SUCC(ret) && i < static_cast<int64_t>(size); ++i) {
+          if (OB_FAIL(skip_value(key_type, depth + 1))) {
+          } else if (OB_FAIL(skip_value(value_type, depth + 1))) {
+            if (OB_BUF_NOT_ENOUGH != ret && OB_INVALID_ARGUMENT != ret) {
+              LOG_WARN("failed to skip map entry", K(ret), K(i));
+            }
+          }
+        }
+      }
+    }
+  } else if (PARQUET_TC_STRUCT == type) {
+    ret = skip_struct(depth + 1);
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("unknown compact type", K(ret), K(type));
+  }
+  return ret;
+}
+
+int ObThriftCompactReader::skip_struct(const int64_t depth)
+{
+  int ret = OB_SUCCESS;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(next_field(prev_id, field_id, type))) {
+    if (OB_FAIL(skip_value(type, depth))) {
+      if (OB_BUF_NOT_ENOUGH != ret && OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to skip field value", K(ret), K(field_id), K(type));
+      }
+    }
+  }
+  if (OB_ITER_END == ret) {
+    // the stop byte of the struct, which is where a skipped value ends
+    ret = OB_SUCCESS;
+  } else if (OB_BUF_NOT_ENOUGH != ret && OB_INVALID_ARGUMENT != ret) {
+    LOG_WARN("failed to skip struct", K(ret), K(depth));
+  }
+  return ret;
+}
+
+namespace
+{
+
+// The file value type one leaf column of a Parquet file is read as. The format
+// states the type of every column, so nothing here samples a value to find one;
+// equally, a column whose annotation this reader cannot express stops the
+// resolve instead of becoming a guess about what the bytes would mean.
+int pq_column_value_type(const ObParquetColumnSchema &column, ObFileValueType &type)
+{
+  int ret = OB_SUCCESS;
+  type = FILE_VALUE_VARCHAR;
+  if (PARQUET_REP_REPEATED == column.repetition_) {
+    ret = parquet_unsupported("parquet column that repeats within a row");
+  } else if (PARQUET_TYPE_BOOLEAN == column.physical_type_) {
+    if (PARQUET_CONV_NONE == column.converted_type_) {
+      type = FILE_VALUE_BOOLEAN;
+    } else {
+      ret = parquet_unsupported("annotated parquet boolean column");
+    }
+  } else if (PARQUET_TYPE_INT32 == column.physical_type_) {
+    // every integer annotation of a four byte column fits an int64, whether the
+    // writer meant it signed or unsigned
+    switch (column.converted_type_) {
+      case PARQUET_CONV_NONE:
+      case PARQUET_CONV_INT_8:
+      case PARQUET_CONV_INT_16:
+      case PARQUET_CONV_INT_32:
+      case PARQUET_CONV_UINT_8:
+      case PARQUET_CONV_UINT_16:
+      case PARQUET_CONV_UINT_32:
+        type = FILE_VALUE_BIGINT;
+        break;
+      default:
+        ret = parquet_unsupported("parquet integer column of an unconvertible logical type");
+        break;
+    }
+  } else if (PARQUET_TYPE_INT64 == column.physical_type_) {
+    if (PARQUET_CONV_NONE == column.converted_type_ || PARQUET_CONV_INT_64 == column.converted_type_) {
+      type = FILE_VALUE_BIGINT;
+    } else {
+      // a timestamp, a time, a decimal or a sixty four bit unsigned integer:
+      // the number stored is not the value SQL would have to show
+      ret = parquet_unsupported("parquet sixty four bit column of an unconvertible logical type");
+    }
+  } else if (PARQUET_TYPE_FLOAT == column.physical_type_
+             || PARQUET_TYPE_DOUBLE == column.physical_type_) {
+    if (PARQUET_CONV_NONE == column.converted_type_) {
+      type = FILE_VALUE_DOUBLE;
+    } else {
+      ret = parquet_unsupported("annotated parquet floating point column");
+    }
+  } else if (PARQUET_TYPE_BYTE_ARRAY == column.physical_type_) {
+    switch (column.converted_type_) {
+      case PARQUET_CONV_NONE:
+      case PARQUET_CONV_UTF8:
+      case PARQUET_CONV_JSON:
+      case PARQUET_CONV_BSON:
+      case PARQUET_CONV_ENUM:
+        type = FILE_VALUE_VARCHAR;
+        break;
+      default:
+        ret = parquet_unsupported("parquet byte array column of an unconvertible logical type");
+        break;
+    }
+  } else {
+    // INT96 is a timestamp of the oldest layout and a fixed length array holds
+    // a decimal or a uuid; neither is a number of the width its bytes state
+    ret = parquet_unsupported("parquet column of this physical type");
+  }
+  return ret;
+}
+
+// The bytes of one page as the page header says they decompress. A block that
+// does not come out the length promised is a broken file, not a hint.
+int pq_decompress(const int64_t codec, const bool is_compressed,
+                  const char *src, const int64_t src_len, const int64_t expect_len,
+                  common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  out.reset();
+  if (src_len < 0 || expect_len < 0) {
+    ret = parquet_bad_file("negative page length");
+  } else if (OB_ISNULL(src) && src_len > 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("page block has no bytes", K(ret), K(src_len));
+  } else if (PARQUET_CODEC_SNAPPY == codec && is_compressed) {
+    if (OB_FAIL(parquet_snappy_decode(src, src_len, expect_len, out))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to decompress parquet page", K(ret), K(src_len), K(expect_len));
+      }
+    }
+  } else if (PARQUET_CODEC_UNCOMPRESSED == codec || !is_compressed) {
+    if (src_len != expect_len) {
+      ret = parquet_bad_file("uncompressed page is not the length its header states");
+    } else if (OB_FAIL(out.assign(src, static_cast<int32_t>(expect_len)))) {
+      LOG_WARN("failed to copy parquet page", K(ret), K(expect_len));
+    }
+  } else {
+    ret = parquet_unsupported("parquet compression codec");
+  }
+  return ret;
+}
+
+// How many of row_count rows hold a value, which is what the values block of a
+// page is measured against: a column that cannot be null has none at all.
+int64_t pq_count_present(const common::ObIArray<int64_t> &def_levels,
+                         const int64_t max_def_level, const int64_t row_count)
+{
+  int64_t count = 0;
+  if (max_def_level <= 0) {
+    count = row_count;
+  } else {
+    for (int64_t i = 0; i < row_count && i < def_levels.count(); ++i) {
+      if (max_def_level == def_levels.at(i)) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+// DataPageHeader of a version 1 page: the count of rows, the encoding of the
+// values and the encoding of each of the two level blocks.
+int pq_parse_data_header_v1(ObThriftCompactReader &reader, ObParquetPageHeader &info)
+{
+  int ret = OB_SUCCESS;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(ret) && OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    int32_t value = 0;
+    if (1 == field_id) {
+      // num_values, which counts every row of the page, nulls included
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.num_values_ = value;
+      }
+    } else if (2 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.encoding_ = value;
+      }
+    } else if (3 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.def_level_encoding_ = value;
+      }
+    } else if (4 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.rep_level_encoding_ = value;
+      }
+    } else {
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+// DictionaryPageHeader: how many values the dictionary holds and how they are
+// written. The values themselves are plain, always.
+int pq_parse_dictionary_header(ObThriftCompactReader &reader, ObParquetPageHeader &info)
+{
+  int ret = OB_SUCCESS;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(ret) && OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    int32_t value = 0;
+    if (1 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.num_values_ = value;
+      }
+    } else if (2 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.encoding_ = value;
+      }
+    } else {
+      // is_sorted, which says nothing to a reader that only looks values up
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+// DataPageHeaderV2: the rows and the values are counted apart, the two level
+// blocks are named by length instead of by encoding, and the flag saying the
+// values are compressed defaults to true.
+int pq_parse_data_header_v2(ObThriftCompactReader &reader, ObParquetPageHeader &info)
+{
+  int ret = OB_SUCCESS;
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(ret) && OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    int32_t value = 0;
+    if (1 == field_id) {
+      // num_values, which counts the values stored and not the nulls among the
+      // rows the page also states
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.num_values_ = value;
+      }
+    } else if (2 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.num_nulls_ = value;
+      }
+    } else if (3 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.num_rows_ = value;
+      }
+    } else if (4 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.encoding_ = value;
+      }
+    } else if (5 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.def_level_bytes_ = value;
+      }
+    } else if (6 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.rep_level_bytes_ = value;
+      }
+    } else if (7 == field_id) {
+      // is_compressed, carried by the type of the field
+      info.is_compressed_ = (PARQUET_TC_BOOLEAN_TRUE == type);
+    } else {
+      // statistics of the page
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+} // end anonymous namespace
+
+ObParquetScanner::ObParquetScanner()
+  : input_(NULL),
+    alloc_(NULL),
+    columns_(NULL),
+    footer_(),
+    meta_(),
+    states_(),
+    row_group_index_(0),
+    row_in_group_(0),
+    group_rows_(0),
+    started_(false)
+{
+}
+
+ObParquetScanner::~ObParquetScanner()
+{
+  close();
+}
+
+void ObParquetScanner::close()
+{
+  for (int64_t i = 0; i < states_.count(); ++i) {
+    ColumnState *state = states_.at(i);
+    if (OB_NOT_NULL(state)) {
+      // a page buffer and the cells indexing it allocate for themselves, so they
+      // have to be torn down one column at a time rather than with the arena a
+      // query resets when it is done
+      state->~ColumnState();
+      if (OB_NOT_NULL(alloc_)) {
+        alloc_->free(state);
+      }
+    }
+  }
+  states_.reuse();
+  footer_.reset();
+  meta_.reset();
+  columns_ = NULL;
+  input_ = NULL;
+  alloc_ = NULL;
+  started_ = false;
+  row_group_index_ = 0;
+  row_in_group_ = 0;
+  group_rows_ = 0;
+}
+
+int ObParquetScanner::open(ObFileInput &input,
+                           const common::ObIArray<ObFileScanColumnDef> &columns)
+{
+  int ret = OB_SUCCESS;
+  close();
+  input_ = &input;
+  alloc_ = &input.allocator();
+  columns_ = &columns;
+  if (OB_FAIL(load_footer())) {
+    if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+        && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to read parquet metadata", K(ret));
+    }
+  } else if (columns.count() != footer_.columns_.count()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                   "the query does not ask for one column per parquet column");
+    LOG_WARN("parquet column count does not match the relation", K(ret),
+             "col_cnt", columns.count(), "file_cnt", footer_.columns_.count());
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    const ObParquetColumnSchema &leaf = footer_.columns_.at(i);
+    ObFileValueType value_type = FILE_VALUE_VARCHAR;
+    // the name the relation was built with has to be the name of the column it
+    // is read from, or a reused plan would hand one column's values to another
+    if (!columns.at(i).column_name_.empty()
+        && 0 != columns.at(i).column_name_.compare(leaf.name_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                     "parquet column name does not match the relation it was resolved from");
+      LOG_WARN("parquet column out of step with the relation", K(ret), K(i),
+               "file_name", leaf.name_, "query_name", columns.at(i).column_name_);
+    } else if (OB_FAIL(pq_column_value_type(leaf, value_type))) {
+      if (OB_NOT_SUPPORTED != ret) {
+        LOG_WARN("failed to map parquet column", K(ret), K(i), K(leaf));
+      }
+    } else {
+      void *buf = alloc_->alloc(sizeof(ColumnState));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate parquet column state", K(ret), K(i));
+      } else {
+        ColumnState *state = new (buf) ColumnState();
+        state->schema_ = &footer_.columns_.at(i);
+        state->max_def_level_ = (PARQUET_REP_OPTIONAL == leaf.repetition_) ? 1 : 0;
+        if (OB_FAIL(states_.push_back(state))) {
+          LOG_WARN("failed to collect parquet column state", K(ret), K(i));
+          state->~ColumnState();
+          alloc_->free(state);
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    started_ = false;
+    row_group_index_ = 0;
+    row_in_group_ = 0;
+    group_rows_ = 0;
+  } else {
+    close();
+  }
+  return ret;
+}
+
+int ObParquetScanner::rescan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(input_) || OB_ISNULL(columns_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("parquet scanner is not opened", K(ret));
+  } else if (OB_FAIL(input_->seek_begin())) {
+    LOG_WARN("failed to rewind parquet file", K(ret));
+  } else {
+    // the metadata was read from the end of a file that has not changed, so only
+    // the cursors of the columns go back to where their first page is
+    for (int64_t i = 0; i < states_.count(); ++i) {
+      ColumnState *state = states_.at(i);
+      if (OB_NOT_NULL(state)) {
+        state->reset_page();
+        state->dict_.reuse();
+        state->dict_text_.reset();
+        state->chunk_ = NULL;
+        state->next_page_offset_ = 0;
+        state->chunk_end_ = 0;
+        state->values_read_ = 0;
+        state->rows_read_ = 0;
+      }
+    }
+    started_ = false;
+    row_group_index_ = 0;
+    row_in_group_ = 0;
+    group_rows_ = 0;
+  }
+  return ret;
+}
+
+int ObParquetScanner::read_at(const int64_t offset, const int64_t len, ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(input_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("parquet scanner is not opened", K(ret));
+  } else if (OB_FAIL(pq_read_range(*input_, offset, len, out))) {
+    if (OB_INVALID_ARGUMENT != ret && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to read parquet block", K(ret), K(offset), K(len));
+    }
+  }
+  return ret;
+}
+
+int ObParquetScanner::load_footer()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(input_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("parquet scanner is not opened", K(ret));
+  } else if (OB_FAIL(pq_load_footer(*input_, meta_, footer_))) {
+    if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+        && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to read parquet metadata", K(ret));
+    }
+  }
+  return ret;
+}
+
+// Bind the chunks of the current row group to the columns and put every cursor
+// back at the first page of its chunk.
+int ObParquetScanner::start_row_group()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(columns_) || OB_ISNULL(alloc_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("parquet scanner is not opened", K(ret));
+  } else if (row_group_index_ < 0 || row_group_index_ >= footer_.row_groups_.count()) {
+    ret = OB_ITER_END;
+  } else {
+    const ObParquetRowGroup &group = footer_.row_groups_.at(row_group_index_);
+    group_rows_ = group.num_rows_;
+    row_in_group_ = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < states_.count(); ++i) {
+      ColumnState *state = states_.at(i);
+      if (OB_ISNULL(state) || OB_ISNULL(state->schema_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("parquet column has no state", K(ret), K(i));
+      } else if (i >= group.chunks_.count() || i >= footer_.columns_.count()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("parquet row group holds no chunk for a column", K(ret), K(i));
+      } else {
+        const ObParquetChunkLocation &chunk = group.chunks_.at(i);
+        const ObParquetColumnSchema &leaf = footer_.columns_.at(i);
+        // a row group whose chunks are listed in another order than the schema
+        // would give one column the pages of another, which is a wrong result
+        // rather than an error, so the name each chunk carries decides
+        if (0 != chunk.path_name_.compare(leaf.name_)) {
+          ret = parquet_bad_file("the chunks of a row group are not in the order of the schema");
+        } else {
+          state->chunk_ = &group.chunks_.at(i);
+          state->reset_page();
+          state->dict_.reuse();
+          state->dict_text_.reset();
+          state->values_read_ = 0;
+          state->rows_read_ = 0;
+          state->next_page_offset_ = (state->chunk_->dictionary_page_offset_ >= 0
+                                      ? state->chunk_->dictionary_page_offset_
+                                      : state->chunk_->data_page_offset_);
+          // the size the footer states for the chunk is what ends its pages: a
+          // writer may leave anything at all between the last page and the
+          // metadata, and the end of the data is no bound a page can be checked
+          // against without mistaking that for one more page
+          state->chunk_end_ = (state->chunk_->total_compressed_size_ > 0
+                               && state->next_page_offset_
+                                  <= footer_.data_end_ - state->chunk_->total_compressed_size_
+                               ? state->next_page_offset_ + state->chunk_->total_compressed_size_
+                               : footer_.data_end_);
+          if (state->next_page_offset_ < 0 || state->next_page_offset_ > footer_.data_end_) {
+            ret = parquet_bad_file_at("column chunk points outside the data of the file",
+                                      state->next_page_offset_);
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// The rows of a file leave in the order its row groups are listed, and one row
+// is laid out by the columns of the relation, projected or not.
+int ObParquetScanner::next_row(common::ObIArray<common::ObString> &row)
+{
+  int ret = OB_SUCCESS;
+  row.reuse();
+  if (OB_ISNULL(input_) || OB_ISNULL(columns_) || OB_ISNULL(alloc_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("parquet scanner is not opened", K(ret));
+  } else {
+    bool got = false;
+    while (OB_SUCC(ret) && !got) {
+      if (!started_) {
+        if (row_group_index_ >= footer_.row_groups_.count()) {
+          ret = OB_ITER_END;
+        } else if (OB_FAIL(start_row_group())) {
+          if (OB_ITER_END != ret && OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret) {
+            LOG_WARN("failed to start parquet row group", K(ret), K_(row_group_index));
+          }
+        } else {
+          started_ = true;
+        }
+      } else if (row_in_group_ >= group_rows_) {
+        // the group is drained; the next pass of this loop opens the one after
+        started_ = false;
+        ++row_group_index_;
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < states_.count(); ++i) {
+          ColumnState &state = *states_.at(i);
+          common::ObString value;
+          if (!columns_->at(i).projected_) {
+            // nothing reads this column, so the pages of the file that hold it
+            // are never opened; the value handed back is a null no caller looks at
+          } else if (OB_FAIL(ensure_page(state, row_in_group_))) {
+            if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+                && OB_SIZE_OVERFLOW != ret) {
+              LOG_WARN("failed to read parquet page", K(ret), K(i), K_(row_in_group));
+            }
+          } else {
+            const int64_t slot = row_in_group_ - state.page_first_row_;
+            if (slot < 0 || slot >= state.cells_.count()) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("parquet page does not hold the row asked for", K(ret), K(i),
+                       K(slot), "cell_cnt", state.cells_.count(),
+                       "page_first_row", state.page_first_row_,
+                       "page_rows", state.page_row_count_);
+            } else {
+              const ObParquetCell &cell = state.cells_.at(slot);
+              if (!cell.is_null_) {
+                if (cell.off_ < 0 || cell.len_ < 0
+                    || cell.off_ + cell.len_ > state.text_.length()) {
+                  ret = OB_ERR_UNEXPECTED;
+                  LOG_WARN("parquet cell points outside its page buffer", K(ret), K(i), K(cell));
+                } else {
+                  // a value of no bytes is still a value: only a cell marked null
+                  // leaves as one, and an empty buffer has no pointer to point at
+                  value.assign_ptr((0 == cell.len_) ? "" : state.text_.ptr() + cell.off_,
+                                   static_cast<int32_t>(cell.len_));
+                }
+              }
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(row.push_back(value))) {
+            LOG_WARN("failed to hand out parquet value", K(ret), K(i));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ++row_in_group_;
+          got = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Decode pages of one column until the row of the row group asked for has a
+// cell. The row group says how many rows there are and the chunk says how many
+// bytes of pages it has, so a column stops at whichever of the two runs out.
+int ObParquetScanner::ensure_page(ColumnState &state, const int64_t row)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret)
+         && (state.page_row_count_ <= 0
+             || row < state.page_first_row_
+             || row >= state.page_first_row_ + state.page_row_count_)) {
+    if (state.rows_read_ >= group_rows_ || state.next_page_offset_ >= state.chunk_end_) {
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(load_page(state))) {
+      if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+          && OB_SIZE_OVERFLOW != ret && OB_ITER_END != ret) {
+        LOG_WARN("failed to decode parquet page", K(ret), K(row),
+                 "rows_read", state.rows_read_, "offset", state.next_page_offset_);
+      }
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = parquet_bad_file("parquet column chunk holds fewer rows than its row group states");
+  }
+  return ret;
+}
+
+// Read and decode the page the cursor of one column is on. A dictionary page
+// holds values but no rows, so reading one leaves the row count of the column
+// where it was and the pass goes on to the page behind it.
+int ObParquetScanner::load_page(ColumnState &state)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(state.chunk_) || OB_ISNULL(state.schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet column is not bound to a chunk", K(ret));
+  } else {
+    bool done = false;
+    while (OB_SUCC(ret) && !done) {
+      const int64_t offset = state.next_page_offset_;
+      ObParquetPageHeader info;
+      ObSqlString body;
+      if (OB_FAIL(read_page(offset, info, body))) {
+        if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+            && OB_SIZE_OVERFLOW != ret) {
+          LOG_WARN("failed to read parquet page", K(ret), K(offset));
+        }
+      } else if (info.header_length_ + info.compressed_size_ > state.chunk_end_ - offset) {
+        // the footer counted the pages of this chunk, so a page the count does
+        // not cover is not one more page of it but the bytes of something else
+        ret = parquet_bad_file("parquet page runs past the chunk that holds it");
+      } else if (PARQUET_PAGE_DICTIONARY == info.page_type_) {
+        if (OB_FAIL(decode_dictionary(state, info, body.ptr(), body.length()))) {
+          if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+              && OB_SIZE_OVERFLOW != ret) {
+            LOG_WARN("failed to decode parquet dictionary page", K(ret), K(offset));
+          }
+        } else {
+          state.next_page_offset_ = offset + info.header_length_ + info.compressed_size_;
+        }
+      } else if (PARQUET_PAGE_DATA == info.page_type_
+                 || PARQUET_PAGE_DATA_V2 == info.page_type_) {
+        if (OB_FAIL(decode_values(state, info, body.ptr(), body.length()))) {
+          if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+              && OB_SIZE_OVERFLOW != ret) {
+            LOG_WARN("failed to decode parquet data page", K(ret), K(offset));
+          }
+        } else {
+          state.next_page_offset_ = offset + info.header_length_ + info.compressed_size_;
+          done = true;
+        }
+      } else {
+        ret = parquet_unsupported("parquet page of this type");
+      }
+    }
+  }
+  return ret;
+}
+
+// One page header and the body it describes. A header is not prefixed by its
+// own length, so the bytes around it are read tentatively and the read grows
+// once more when the parse runs off the end of them.
+int ObParquetScanner::read_page(const int64_t offset, ObParquetPageHeader &info,
+                                ObSqlString &body)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString head;
+  const int64_t remaining = footer_.data_end_ - offset;
+  int64_t try_len = PARQUET_HEAD_TRY_LEN;
+  bool parsed = false;
+  info.reset();
+  body.reset();
+  if (offset < 0 || offset >= footer_.data_end_) {
+    ret = parquet_bad_file_at("page lies outside the data of the file", offset);
+  }
+  while (OB_SUCC(ret) && !parsed) {
+    const int64_t want = (try_len < remaining) ? try_len : remaining;
+    if (OB_FAIL(read_at(offset, want, head))) {
+      if (OB_INVALID_ARGUMENT != ret && OB_SIZE_OVERFLOW != ret) {
+        LOG_WARN("failed to read parquet page header", K(ret), K(offset), K(want));
+      }
+    } else {
+      const int tmp_ret = parse_page_header(head.ptr(), head.length(), info);
+      if (OB_SUCCESS == tmp_ret) {
+        parsed = true;
+      } else if (OB_BUF_NOT_ENOUGH == tmp_ret) {
+        if (want >= remaining || want >= PARQUET_HEAD_MAX_LEN) {
+          ret = parquet_bad_file("parquet page header runs past the data of the file");
+        } else {
+          try_len = (2 * want < PARQUET_HEAD_MAX_LEN) ? 2 * want : PARQUET_HEAD_MAX_LEN;
+        }
+      } else {
+        ret = tmp_ret;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (info.header_length_ <= 0 || info.header_length_ > head.length()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet page header length is not the bytes it took", K(ret), K(info));
+  } else if (info.compressed_size_ > remaining - info.header_length_) {
+    ret = parquet_bad_file("parquet page body runs past the data of the file");
+  } else if (OB_FAIL(read_at(offset + info.header_length_, info.compressed_size_, body))) {
+    if (OB_INVALID_ARGUMENT != ret && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to read parquet page body", K(ret), K(info));
+    }
+  }
+  return ret;
+}
+
+// The thrift compact struct in front of one page. OB_BUF_NOT_ENOUGH is left to
+// mean what it says: the header may be longer than the buffer tried for it, so
+// the caller reads further and parses again.
+int ObParquetScanner::parse_page_header(const char *buf, const int64_t buf_len,
+                                        ObParquetPageHeader &info)
+{
+  int ret = OB_SUCCESS;
+  info.reset();
+  ObThriftCompactReader reader;
+  reader.init(buf, buf_len, 0);
+  int64_t prev_id = 0;
+  int64_t field_id = 0;
+  int8_t type = 0;
+  while (OB_SUCC(ret) && OB_SUCC(reader.next_field(prev_id, field_id, type))) {
+    int32_t value = 0;
+    if (1 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.page_type_ = value;
+      }
+    } else if (2 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.uncompressed_size_ = value;
+      }
+    } else if (3 == field_id) {
+      if (OB_FAIL(reader.read_i32(value))) {
+      } else {
+        info.compressed_size_ = value;
+      }
+    } else if (5 == field_id && PARQUET_TC_STRUCT == type) {
+      ret = pq_parse_data_header_v1(reader, info);
+    } else if (7 == field_id && PARQUET_TC_STRUCT == type) {
+      ret = pq_parse_dictionary_header(reader, info);
+    } else if (8 == field_id && PARQUET_TC_STRUCT == type) {
+      ret = pq_parse_data_header_v2(reader, info);
+    } else {
+      // the checksum, the column index offsets and whatever a newer library
+      // writes where this one has no field
+      ret = reader.skip(type);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    info.header_length_ = reader.pos();
+    ret = OB_SUCCESS;
+    if (info.compressed_size_ < 0 || info.uncompressed_size_ < 0) {
+      ret = parquet_bad_file("parquet page header states a negative size");
+    } else if (info.compressed_size_ > ObFileScanLimits::MAX_PAGE_LENGTH
+               || info.uncompressed_size_ > ObFileScanLimits::MAX_PAGE_LENGTH) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("parquet page is too large to read", K(ret), K(info),
+               "limit", ObFileScanLimits::MAX_PAGE_LENGTH);
+    }
+  } else if (OB_BUF_NOT_ENOUGH != ret) {
+    if (OB_INVALID_ARGUMENT == ret) {
+      ret = parquet_bad_file("parquet page header is malformed");
+    } else {
+      LOG_WARN("failed to read parquet page header", K(ret), K(field_id), K(type));
+    }
+  }
+  return ret;
+}
+
+int ObParquetScanner::decode_levels(const char *src, const int64_t src_len,
+                                    const int64_t bit_width, const int64_t count,
+                                    common::ObIArray<int64_t> &levels,
+                                    int64_t &consumed)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(parquet_hybrid_decode(src, src_len, bit_width, count, levels, consumed))) {
+    if (OB_INVALID_ARGUMENT != ret) {
+      LOG_WARN("failed to decode parquet levels", K(ret), K(bit_width), K(count), K(src_len));
+    }
+  } else if (count != levels.count()) {
+    ret = parquet_bad_file("parquet level block holds fewer levels than the page counts");
+  }
+  return ret;
+}
+
+// The dictionary of one column chunk: a plain list of values, held in a buffer
+// of its own because the pages that index it live beside it, not inside it.
+int ObParquetScanner::decode_dictionary(ColumnState &state, const ObParquetPageHeader &info,
+                                        const char *body, const int64_t body_len)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString plain;
+  ObFileValueType value_type = FILE_VALUE_VARCHAR;
+  state.dict_.reuse();
+  state.dict_text_.reset();
+  if (OB_ISNULL(state.chunk_) || OB_ISNULL(state.schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet column is not bound to a chunk", K(ret));
+  } else if (PARQUET_ENC_PLAIN != info.encoding_) {
+    ret = parquet_unsupported("parquet dictionary page that is not plain encoded");
+  } else if (info.num_values_ < 0) {
+    ret = parquet_bad_file("parquet dictionary page states a negative count");
+  } else if (OB_FAIL(pq_column_value_type(*state.schema_, value_type))) {
+  } else if (OB_FAIL(pq_decompress(state.chunk_->codec_, true, body, body_len,
+                                   info.uncompressed_size_, plain))) {
+    if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to decompress parquet dictionary", K(ret), K(info));
+    }
+  } else {
+    int64_t pos = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < info.num_values_; ++i) {
+      ObParquetCell cell;
+      if (OB_FAIL(read_value(*state.schema_, state.dict_text_, plain.ptr(),
+                             plain.length(), pos, cell))) {
+        if (OB_INVALID_ARGUMENT != ret) {
+          LOG_WARN("failed to read parquet dictionary value", K(ret), K(i), K(pos));
+        }
+      } else if (OB_FAIL(state.dict_.push_back(cell))) {
+        LOG_WARN("failed to collect parquet dictionary value", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+// The rows of one data page: the levels first, because they decide which rows
+// hold a value at all, then the values the two page versions lay out apart.
+int ObParquetScanner::decode_values(ColumnState &state, const ObParquetPageHeader &info,
+                                    const char *body, const int64_t body_len)
+{
+  int ret = OB_SUCCESS;
+  const bool is_v2 = (PARQUET_PAGE_DATA_V2 == info.page_type_);
+  ObSqlString plain;
+  common::ObSEArray<int64_t, 64> def_levels;
+  const char *values = NULL;
+  int64_t values_len = 0;
+  int64_t row_count = 0;
+  const int64_t max_def = state.max_def_level_;
+  const int64_t page_first = state.rows_read_;
+  state.reset_page();
+  state.page_first_row_ = page_first;
+  if (OB_ISNULL(state.chunk_) || OB_ISNULL(state.schema_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet column is not bound to a chunk", K(ret));
+  } else if (info.num_values_ < 0) {
+    ret = parquet_bad_file("parquet data page states a negative count");
+  } else if (is_v2) {
+    // a version 2 page keeps its levels in front of the values, uncompressed,
+    // and states how long each of the two blocks is; a flat schema has none
+    if (0 != info.rep_level_bytes_) {
+      ret = parquet_unsupported("parquet data page with repetition levels");
+    } else if (info.def_level_bytes_ > body_len) {
+      ret = parquet_bad_file("parquet page levels run past its body");
+    } else if (info.num_rows_ < 0 || info.num_nulls_ < 0
+               || info.num_rows_ != info.num_values_ + info.num_nulls_) {
+      ret = parquet_bad_file("parquet data page counts its rows and its values apart");
+    } else {
+      row_count = info.num_rows_;
+      int64_t consumed = 0;
+      if (0 == max_def && 0 != info.def_level_bytes_) {
+        ret = parquet_bad_file("parquet page holds levels for a column that cannot be null");
+      } else if (max_def > 0
+                 && OB_FAIL(decode_levels(body, info.def_level_bytes_,
+                                          parquet_level_bit_width(max_def), row_count,
+                                          def_levels, consumed))) {
+      } else if (max_def > 0 && consumed != info.def_level_bytes_) {
+        ret = parquet_bad_file("parquet page levels do not fill the bytes its header states");
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        const int64_t values_at = info.def_level_bytes_;
+        const int64_t expect_len = info.uncompressed_size_ - values_at;
+        if (expect_len < 0) {
+          ret = parquet_bad_file("parquet page is smaller uncompressed than its levels alone");
+        } else if (OB_FAIL(pq_decompress(state.chunk_->codec_, info.is_compressed_,
+                                         body + values_at, body_len - values_at,
+                                         expect_len, plain))) {
+          if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+              && OB_SIZE_OVERFLOW != ret) {
+            LOG_WARN("failed to decompress parquet values", K(ret), K(info));
+          }
+        } else {
+          values = plain.ptr();
+          values_len = plain.length();
+        }
+      }
+    }
+  } else {
+    // a version 1 page holds both level blocks inside the compressed body, each
+    // one prefixed by the bit width its levels were packed with. The width is
+    // taken from the page rather than computed from the schema, which is what
+    // the layout says a reader should do.
+    if (OB_FAIL(pq_decompress(state.chunk_->codec_, true, body, body_len,
+                              info.uncompressed_size_, plain))) {
+      if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret && OB_SIZE_OVERFLOW != ret) {
+        LOG_WARN("failed to decompress parquet page", K(ret), K(info));
+      }
+    } else {
+      row_count = info.num_values_;
+      int64_t pos = 0;
+      int64_t consumed = 0;
+      int64_t width = 0;
+      // the repetition levels of a flat schema are all zero, which is a block of
+      // nothing behind a byte saying so
+      if (pos + 1 > plain.length()) {
+        ret = parquet_bad_file("parquet data page holds no repetition level block");
+      } else {
+        width = static_cast<uint8_t>(plain.ptr()[pos]);
+        ++pos;
+        if (0 != width) {
+          ret = parquet_unsupported("parquet data page with repetition levels");
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (pos + 1 > plain.length()) {
+        ret = parquet_bad_file("parquet data page holds no definition level block");
+      } else {
+        width = static_cast<uint8_t>(plain.ptr()[pos]);
+        ++pos;
+        if (width > 0 && 0 == max_def) {
+          ret = parquet_bad_file("parquet page holds levels for a column that cannot be null");
+        } else if (width > 0
+                   && OB_FAIL(decode_levels(plain.ptr() + pos, plain.length() - pos, width,
+                                            row_count, def_levels, consumed))) {
+        } else if (width > 0) {
+          pos += consumed;
+        } else if (max_def > 0) {
+          ret = parquet_bad_file("parquet levels of a nullable column are packed in no bits");
+        }
+      }
+      if (OB_SUCC(ret)) {
+        values = plain.ptr() + pos;
+        values_len = plain.length() - pos;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (row_count <= 0) {
+    ret = parquet_bad_file("parquet data page holds no row");
+  } else if (PARQUET_ENC_PLAIN == info.encoding_) {
+    if (OB_FAIL(format_plain(*state.schema_, state.text_, state.cells_, values, values_len,
+                             def_levels, max_def, row_count))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to read parquet values", K(ret), K(info), K(row_count));
+      }
+    }
+  } else if (PARQUET_ENC_RLE_DICTIONARY == info.encoding_) {
+    if (state.dict_.count() <= 0) {
+      ret = parquet_bad_file("parquet index page read before the dictionary it indexes");
+    } else if (OB_FAIL(format_dictionary(state, values, values_len, def_levels,
+                                         max_def, row_count))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to read parquet indexes", K(ret), K(info), K(row_count));
+      }
+    }
+  } else {
+    // the legacy dictionary encoding puts the levels inside the block of
+    // indexes, and the delta and byte stream splittings each need a decoder of
+    // their own; none of them is guessed at
+    ret = parquet_unsupported("parquet data page encoding");
+  }
+  if (OB_SUCC(ret)) {
+    state.page_first_row_ = page_first;
+    state.page_row_count_ = row_count;
+    state.rows_read_ += row_count;
+    state.values_read_ += pq_count_present(def_levels, max_def, row_count);
+  }
+  return ret;
+}
+
+// Cells for every row of one plain encoded page, in the order of the rows. The
+// text of a value goes into the buffer of the column and the cell keeps where
+// in it the value landed, so handing a row out copies nothing.
+int ObParquetScanner::format_plain(const ObParquetColumnSchema &schema, ObSqlString &text,
+                                   common::ObIArray<ObParquetCell> &cells,
+                                   const char *values, const int64_t values_len,
+                                   const common::ObIArray<int64_t> &def_levels,
+                                   const int64_t max_def_level, const int64_t row_count)
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+  for (int64_t r = 0; OB_SUCC(ret) && r < row_count; ++r) {
+    ObParquetCell cell;
+    const bool present = (max_def_level <= 0)
+                         || (r < def_levels.count() && max_def_level == def_levels.at(r));
+    if (!present) {
+      cell.is_null_ = true;
+    } else if (OB_FAIL(read_value(schema, text, values, values_len, pos, cell))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to read parquet value", K(ret), K(r), K(pos), K(schema));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(cells.push_back(cell))) {
+      LOG_WARN("failed to collect parquet cell", K(ret), K(r));
+    }
+  }
+  return ret;
+}
+
+// Cells for every row of a page whose values the dictionary page already
+// turned into text: one index per value, packed the way the levels are.
+int ObParquetScanner::format_dictionary(ColumnState &state,
+                                        const char *index_bytes, const int64_t index_len,
+                                        const common::ObIArray<int64_t> &def_levels,
+                                        const int64_t max_def_level, const int64_t row_count)
+{
+  int ret = OB_SUCCESS;
+  common::ObSEArray<int64_t, 64> indexes;
+  int64_t consumed = 0;
+  const int64_t value_count = pq_count_present(def_levels, max_def_level, row_count);
+  if (index_len < 1) {
+    ret = parquet_bad_file("parquet index page holds no block of indexes");
+  } else {
+    const int64_t width = static_cast<uint8_t>(index_bytes[0]);
+    if (OB_FAIL(decode_levels(index_bytes + 1, index_len - 1, width, value_count,
+                              indexes, consumed))) {
+      if (OB_INVALID_ARGUMENT != ret) {
+        LOG_WARN("failed to decode parquet indexes", K(ret), K(width), K(value_count));
+      }
+    } else {
+      int64_t slot = 0;
+      for (int64_t r = 0; OB_SUCC(ret) && r < row_count; ++r) {
+        ObParquetCell cell;
+        const bool present = (max_def_level <= 0)
+                             || (r < def_levels.count() && max_def_level == def_levels.at(r));
+        if (!present) {
+          cell.is_null_ = true;
+        } else if (slot >= indexes.count()) {
+          ret = parquet_bad_file("parquet index block holds fewer indexes than values");
+        } else {
+          const int64_t dict_slot = indexes.at(slot);
+          ++slot;
+          if (dict_slot < 0 || dict_slot >= state.dict_.count()) {
+            ret = parquet_bad_file("parquet dictionary index names no value in the dictionary");
+          } else {
+            const ObParquetCell &entry = state.dict_.at(dict_slot);
+            cell.off_ = state.text_.length();
+            cell.len_ = entry.len_;
+            if (entry.off_ < 0 || entry.len_ < 0
+                || entry.off_ + entry.len_ > state.dict_text_.length()) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("parquet dictionary value points outside its buffer", K(ret),
+                       K(dict_slot), K(entry));
+            } else if (entry.len_ > 0
+                       && OB_FAIL(state.text_.append(state.dict_text_.ptr() + entry.off_,
+                                                     entry.len_))) {
+              LOG_WARN("failed to copy parquet dictionary value", K(ret), K(dict_slot));
+            }
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(state.cells_.push_back(cell))) {
+          LOG_WARN("failed to collect parquet cell", K(ret), K(r));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// One value of the physical type the footer gave the column, written as the
+// text the parser of its inferred type accepts. The position moves by the bytes
+// the value took, except for a boolean, of which eight share one byte.
+int ObParquetScanner::read_value(const ObParquetColumnSchema &schema, ObSqlString &text,
+                                 const char *src, const int64_t src_len, int64_t &pos,
+                                 ObParquetCell &cell)
+{
+  int ret = OB_SUCCESS;
+  cell.reset();
+  if (OB_ISNULL(src) && src_len > 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet value block has no bytes", K(ret), K(src_len));
+  } else if (PARQUET_TYPE_BOOLEAN == schema.physical_type_) {
+    // bits are numbered from the low end of each byte, which is the order the
+    // format packs them in
+    const int64_t byte = pos / 8;
+    const int64_t bit = pos % 8;
+    if (byte < 0 || byte >= src_len) {
+      ret = parquet_bad_file("parquet boolean value runs past its page");
+    } else {
+      const uint8_t packed = static_cast<uint8_t>(src[byte]);
+      ++pos;
+      ret = append_bool(text, 0 != ((packed >> bit) & 1), cell);
+    }
+  } else if (PARQUET_TYPE_INT32 == schema.physical_type_
+             || PARQUET_TYPE_FLOAT == schema.physical_type_) {
+    if (pos + 4 > src_len) {
+      ret = parquet_bad_file("parquet four byte value runs past its page");
+    } else if (PARQUET_TYPE_FLOAT == schema.physical_type_) {
+      ret = append_double(text, parquet_le_float(src + pos), cell);
+      pos += 4;
+    } else {
+      const bool is_unsigned = (PARQUET_CONV_UINT_8 == schema.converted_type_
+                                 || PARQUET_CONV_UINT_16 == schema.converted_type_
+                                 || PARQUET_CONV_UINT_32 == schema.converted_type_);
+      const int64_t value = is_unsigned ? static_cast<int64_t>(parquet_le_u64(src + pos, 4))
+                                        : parquet_le_i64(src + pos, 4);
+      ret = append_number(text, value, cell);
+      pos += 4;
+    }
+  } else if (PARQUET_TYPE_INT64 == schema.physical_type_
+             || PARQUET_TYPE_DOUBLE == schema.physical_type_) {
+    if (pos + 8 > src_len) {
+      ret = parquet_bad_file("parquet eight byte value runs past its page");
+    } else if (PARQUET_TYPE_DOUBLE == schema.physical_type_) {
+      ret = append_double(text, parquet_le_double(src + pos), cell);
+      pos += 8;
+    } else {
+      ret = append_number(text, parquet_le_i64(src + pos, 8), cell);
+      pos += 8;
+    }
+  } else if (PARQUET_TYPE_BYTE_ARRAY == schema.physical_type_) {
+    if (pos + 4 > src_len) {
+      ret = parquet_bad_file("parquet value length runs past its page");
+    } else {
+      const int64_t len = static_cast<int64_t>(parquet_le_u64(src + pos, 4));
+      pos += 4;
+      if (len < 0 || len > PARQUET_MAX_VALUE_LENGTH) {
+        ret = parquet_bad_file("parquet string value is longer than any record may hold");
+      } else if (len > src_len - pos) {
+        ret = parquet_bad_file("parquet string value runs past its page");
+      } else {
+        ret = append_text(text, src + pos, len, cell);
+        pos += len;
+      }
+    }
+  } else {
+    ret = parquet_bad_file("parquet column has a physical type this reader was not built for");
+  }
+  return ret;
+}
+
+int ObParquetScanner::append_number(ObSqlString &text, const int64_t value,
+                                    ObParquetCell &cell)
+{
+  int ret = OB_SUCCESS;
+  cell.off_ = text.length();
+  if (OB_FAIL(text.append_fmt("%ld", value))) {
+    LOG_WARN("failed to write parquet integer", K(ret), K(value));
+  } else {
+    cell.len_ = text.length() - cell.off_;
+  }
+  return ret;
+}
+
+int ObParquetScanner::append_double(ObSqlString &text, const double value,
+                                    ObParquetCell &cell)
+{
+  int ret = OB_SUCCESS;
+  cell.off_ = text.length();
+  // fifteen significant digits round-trip a double the way its writer meant it,
+  // and 1.5 does not come out as 1.5000000000000002
+  if (OB_FAIL(text.append_fmt("%.15g", value))) {
+    LOG_WARN("failed to write parquet float", K(ret), K(value));
+  } else {
+    cell.len_ = text.length() - cell.off_;
+  }
+  return ret;
+}
+
+int ObParquetScanner::append_bool(ObSqlString &text, const bool value, ObParquetCell &cell)
+{
+  int ret = OB_SUCCESS;
+  cell.off_ = text.length();
+  if (OB_FAIL(text.append(value ? "true" : "false", value ? 4 : 5))) {
+    LOG_WARN("failed to write parquet boolean", K(ret), K(value));
+  } else {
+    cell.len_ = text.length() - cell.off_;
+  }
+  return ret;
+}
+
+int ObParquetScanner::append_text(ObSqlString &text, const char *value, const int64_t len,
+                                  ObParquetCell &cell)
+{
+  int ret = OB_SUCCESS;
+  cell.off_ = text.length();
+  if (len > 0 && OB_FAIL(text.append(value, len))) {
+    LOG_WARN("failed to write parquet string", K(ret), K(len));
+  } else {
+    cell.len_ = text.length() - cell.off_;
+  }
+  return ret;
+}
+
+// The schema a Parquet file declares for itself, read from the footer alone:
+// nothing of the file's rows is looked at, because the file states the type of
+// every column it holds.
+int ObFileScanUtils::read_parquet_schema(common::ObIAllocator &alloc,
+                                         const common::ObString &real_path,
+                                         common::ObIArray<common::ObString> &names,
+                                         common::ObIArray<ObFileColumnSchema> &schema)
+{
+  int ret = OB_SUCCESS;
+  ObFileInput input;
+  ObSqlString meta;
+  ObParquetFooter footer;
+  names.reuse();
+  schema.reuse();
+  if (real_path.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid resolved path", K(ret), K(real_path));
+  } else if (OB_FAIL(input.open(alloc, real_path))) {
+    LOG_WARN("failed to open file for parquet schema", K(ret), K(real_path));
+  } else if (OB_FAIL(pq_load_footer(input, meta, footer))) {
+    if (OB_INVALID_ARGUMENT != ret && OB_NOT_SUPPORTED != ret
+        && OB_SIZE_OVERFLOW != ret) {
+      LOG_WARN("failed to read parquet metadata", K(ret), K(real_path));
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < footer.columns_.count(); ++i) {
+      const ObParquetColumnSchema &leaf = footer.columns_.at(i);
+      ObFileColumnSchema one;
+      ObFileValueType type = FILE_VALUE_VARCHAR;
+      common::ObString name;
+      if (OB_FAIL(pq_column_value_type(leaf, type))) {
+        if (OB_NOT_SUPPORTED != ret) {
+          LOG_WARN("failed to map parquet column", K(ret), K(i), K(leaf));
+        }
+      } else if (OB_FAIL(ob_write_string(alloc, leaf.name_, name))) {
+        LOG_WARN("failed to copy column name", K(ret), K(i), K(leaf));
+      } else if (OB_FAIL(names.push_back(name))) {
+        LOG_WARN("failed to push column name", K(ret), K(name));
+      } else {
+        one.type_ = type;
+        one.nullable_ = (PARQUET_REP_OPTIONAL == leaf.repetition_);
+        one.scale_ = 0;
+        if (OB_FAIL(schema.push_back(one))) {
+          LOG_WARN("failed to push column schema", K(ret), K(i), K(one));
+        }
+      }
+    }
+  }
+  input.close();
   return ret;
 }
 
