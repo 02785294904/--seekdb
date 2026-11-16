@@ -20,6 +20,7 @@
 #include "sql/privilege_check/ob_ai_model_priv_util.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
+#include "share/schema/ob_multi_version_schema_service.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
@@ -90,9 +91,23 @@ int ObAiServiceGuard::check_access_privilege()
     // system background task thread do not have session, skip check
   } else {
     ObArenaAllocator tmp_allocator;
-    share::schema::ObSchemaGetterGuard *schema_guard = session->get_cur_exec_ctx()->get_sql_ctx()->schema_guard_;
-    if (OB_ISNULL(schema_guard)) {
+    share::schema::ObSchemaGetterGuard runtime_guard;
+    share::schema::ObSchemaGetterGuard *schema_guard = nullptr;
+    if (OB_NOT_NULL(session->get_cur_exec_ctx()) &&
+        OB_NOT_NULL(session->get_cur_exec_ctx()->get_sql_ctx())) {
+      schema_guard = session->get_cur_exec_ctx()->get_sql_ctx()->schema_guard_;
+    }
+    if (OB_ISNULL(schema_guard) && OB_NOT_NULL(GCTX.schema_service_)) {
+      if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(runtime_guard))) {
+        LOG_WARN("failed to get runtime schema guard for ai model privilege", K(ret));
+      } else {
+        schema_guard = &runtime_guard;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(schema_guard)) {
       ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("schema guard is unavailable for ai model privilege", K(ret));
     } else {
       sql::ObAIServiceEndpointPrivUtil priv_util(*schema_guard);
       share::schema::ObSessionPrivInfo session_priv;
