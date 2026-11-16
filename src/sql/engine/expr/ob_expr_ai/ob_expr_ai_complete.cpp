@@ -153,15 +153,28 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
 
     if (OB_FAIL(ret)){
     } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
+      if (ret == OB_ERR_UNEXPECTED) {
+        FORWARD_USER_ERROR(ret, "ai_complete: load model");
+      }
     } else if (OB_ISNULL(endpoint_resolver)) {
       ret = OB_ERR_UNEXPECTED;
+      FORWARD_USER_ERROR(ret, "ai_complete: endpoint resolver unavailable");
     } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(
                    model_id, temp_allocator, resolved_endpoint))) {
+      if (ret == OB_ERR_UNEXPECTED) {
+        FORWARD_USER_ERROR(ret, "ai_complete: resolve endpoint");
+      }
     } else {
       ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
       ObString result;
       if (OB_FAIL(model.call_completion(prompt, config, result))) {
+        if (ret == OB_ERR_UNEXPECTED) {
+          FORWARD_USER_ERROR(ret, "ai_complete: request completion");
+        }
       } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
+        if (ret == OB_ERR_UNEXPECTED) {
+          FORWARD_USER_ERROR(ret, "ai_complete: write result");
+        }
       }
     }
   }
