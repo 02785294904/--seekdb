@@ -908,6 +908,9 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
       || T_FUN_SYS_GUID == type_
       || T_FUN_SYS_STMT_ID == type_
       || T_FUN_SYS_SLEEP == type_
+      || T_FUN_SYS_AI_COMPLETE == type_
+      || T_FUN_SYS_AI_EMBED == type_
+      || T_FUN_SYS_AI_RERANK == type_
       || T_OP_ASSIGN == type_
       || T_FUN_SYS_REMOVE_CONST == type_
       || T_FUN_SYS_WRAPPER_INNER == type_

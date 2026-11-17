@@ -26,6 +26,19 @@ namespace oceanbase
 namespace common 
 {
 
+namespace
+{
+bool is_valid_completion_content(const ObIJsonBase *content)
+{
+  if (OB_ISNULL(content)) {
+    return false;
+  }
+  const ObJsonNodeType type = content->json_type();
+  return type == ObJsonNodeType::J_OBJECT || type == ObJsonNodeType::J_ARRAY ||
+         (type == ObJsonNodeType::J_STRING && content->get_data_length() > 0);
+}
+}
+
 int ObOpenAIUtils::get_header(common::ObIAllocator &allocator,
                               ObString &api_key,
                               common::ObArray<ObString> &headers) 
@@ -173,11 +186,7 @@ int ObOpenAIUtils::ObOpenAIComplete::parse_output(common::ObIAllocator &allocato
     ObJsonSeekResult hit;
     if (OB_FAIL(j_path.parse_path())) {
     } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
-    } else if (hit.size() == 0 || OB_ISNULL(hit[0])) {
-      ret = OB_INVALID_DATA;
-    } else if (hit[0]->json_type() != ObJsonNodeType::J_STRING &&
-               hit[0]->json_type() != ObJsonNodeType::J_OBJECT &&
-               hit[0]->json_type() != ObJsonNodeType::J_ARRAY) {
+    } else if (hit.size() == 0 || !is_valid_completion_content(hit[0])) {
       ret = OB_INVALID_DATA;
     } else {
       result = hit[0];
@@ -372,7 +381,8 @@ int ObOllamaUtils::ObOllamaComplete::parse_output(common::ObIAllocator &allocato
     if (OB_FAIL(j_path.parse_path())) {
     } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
     } else if (hit.size() == 0 || OB_ISNULL(hit[0]) ||
-               hit[0]->json_type() != ObJsonNodeType::J_STRING) {
+               hit[0]->json_type() != ObJsonNodeType::J_STRING ||
+               hit[0]->get_data_length() == 0) {
       ret = OB_INVALID_DATA;
     } else if (OB_ISNULL(http_response->get_value("done")) ||
                http_response->get_value("done")->json_type() != ObJsonNodeType::J_BOOLEAN ||
@@ -577,9 +587,7 @@ int ObDashscopeUtils::ObDashscopeComplete::parse_output(ObIAllocator &allocator,
             ret = OB_INVALID_DATA;
           } else {
             ObJsonNode *content = static_cast<ObJsonObject *>(message)->get_value("content");
-            if (OB_ISNULL(content) || (content->json_type() != ObJsonNodeType::J_STRING &&
-                                       content->json_type() != ObJsonNodeType::J_OBJECT &&
-                                       content->json_type() != ObJsonNodeType::J_ARRAY)) {
+            if (!is_valid_completion_content(content)) {
               ret = OB_INVALID_DATA;
             } else {
               result = content;
@@ -1054,7 +1062,9 @@ int ObAIFuncJsonUtils::print_json_to_str(ObIAllocator &allocator, ObIJsonBase *b
 {
   int ret = OB_SUCCESS;
   ObJsonBuffer j_buf(&allocator);
-  if (OB_FAIL(base_node->print(j_buf, 0))) {
+  if (OB_ISNULL(base_node)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(base_node->print(j_buf, 0))) {
   } else {
     str = j_buf.string();
   }
@@ -1109,17 +1119,12 @@ int ObAIFuncJsonUtils::validate_completion_config(ObJsonObject *config)
                  key.case_compare("options") == 0) {
         ret = OB_INVALID_ARGUMENT;
       } else if (key.case_compare("temperature") == 0) {
-        if (value->json_type() == ObJsonNodeType::J_DOUBLE) {
-          double temperature = static_cast<ObJsonDouble *>(value)->get_double();
-          if (!std::isfinite(temperature) || temperature < 0.0) {
-            ret = OB_INVALID_ARGUMENT;
-          }
-        } else if (value->json_type() == ObJsonNodeType::J_INT) {
-          if (static_cast<ObJsonInt *>(value)->get_int() < 0) {
-            ret = OB_INVALID_ARGUMENT;
-          }
-        } else {
+        double temperature = 0.0;
+        if (!value->is_json_number(value->json_type()) ||
+            OB_FAIL(value->to_double(temperature)) ||
+            !std::isfinite(temperature) || temperature < 0.0) {
           ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, temperature must be a finite nonnegative number");
         }
       } else if (key.case_compare("max_tokens") == 0) {
         if (value->json_type() != ObJsonNodeType::J_INT ||
